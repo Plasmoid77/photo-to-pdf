@@ -714,19 +714,38 @@ def evaluate(args):
 
 
 def grid_period(profile, low, high):
-    """Dominant period (px) of a ruling profile between `low` and `high` px, with its SNR."""
+    """Ruling period (px) between `low` and `high` from the autocorrelation of a profile.
+
+    The first autocorrelation peak that reaches 60 % of the strongest one is the cell; harmonics
+    of thin lines do not create such a peak at half the period. The estimate is refined on the
+    2nd-4th multiples. Returns (period, correlation at that lag), or (None, 0).
+    """
     import numpy as np
     profile = np.asarray(profile, float)
     profile = profile - np.convolve(profile, np.ones(31) / 31, mode='same')
-    profile = profile[15:-15] * np.hanning(len(profile) - 30)
-    size = 1 << (len(profile) * 8).bit_length()
-    spectrum = np.abs(np.fft.rfft(profile, size))
-    freq = np.fft.rfftfreq(size)
-    band = (freq > 1 / high) & (freq < 1 / low)
-    if not band.any():
+    profile = profile[15:-15] - profile[15:-15].mean()
+    if len(profile) < 3 * low or not profile.any():
         return None, 0.
-    k = int(np.argmax(spectrum * band))
-    return 1 / freq[k], float(spectrum[k] / max(np.median(spectrum[band]), 1e-9))
+    ac = np.correlate(profile, profile, 'full')[len(profile) - 1:]
+    ac = ac / ac[0]
+    def peak(i):
+        return 0 < i < len(ac) - 1 and ac[i] > ac[i - 1] and ac[i] >= ac[i + 1]
+    def vertex(i):
+        a, b, c = ac[i - 1], ac[i], ac[i + 1]
+        return i + (.5 * (a - c) / (a - 2 * b + c) if a - 2 * b + c else 0.)
+    peaks = [i for i in range(max(2, int(low)), min(int(high) + 1, len(ac) - 1)) if peak(i) and ac[i] > 0]
+    if not peaks:
+        return None, 0.
+    strongest = max(ac[i] for i in peaks)
+    first = next(i for i in peaks if ac[i] >= .6 * strongest)
+    period = vertex(first)
+    for multiple in (2, 3, 4):
+        guess = int(round(multiple * period))
+        near = [i for i in range(guess - 2, guess + 3) if peak(i)]
+        if not near:
+            break
+        period = vertex(max(near, key=lambda i: ac[i])) / multiple
+    return float(period), float(ac[first])
 
 
 def page_images(path, work):
@@ -760,10 +779,10 @@ def measure(args):
         px, sx = grid_period(core.mean(0), low, high)
         py, sy = grid_period(core.mean(1), low, high)
         row = dict(page=number, file=path.name, pixels=[w, h], cell_x=px and round(px, 2), cell_y=py and round(py, 2),
-                   snr=[round(sx, 1), round(sy, 1)])
-        if py and sy >= args.min_snr:
+                   correlation=[round(sx, 2), round(sy, 2)])
+        if py and sy >= args.min_correlation:
             row['height_mm'] = round(h / py * args.cell_mm, 1)
-            if px and sx >= args.min_snr:
+            if px and sx >= args.min_correlation and .9 < px / py < 1.1:
                 row['width_mm'] = round(w / px * args.cell_mm, 1)
                 row['aspect'] = round(row['width_mm'] / row['height_mm'], 4)
                 row['cell_ratio'] = round(px / py, 4)
@@ -961,9 +980,9 @@ def main():
     p.add_argument('input', type=Path, help='Build *-pages directory or a PDF')
     p.add_argument('--work', type=Path, required=True)
     p.add_argument('--cell-mm', type=float, default=5.0)
-    p.add_argument('--min-cell-px', type=float, default=15.0)
-    p.add_argument('--max-cell-px', type=float, default=120.0)
-    p.add_argument('--min-snr', type=float, default=6.0)
+    p.add_argument('--min-cell-px', type=float, default=10.0)
+    p.add_argument('--max-cell-px', type=float, default=150.0)
+    p.add_argument('--min-correlation', type=float, default=.3, help='Ruling autocorrelation needed to trust a page')
     p.set_defaults(run=measure)
     p = subs.add_parser('compare', help='Built pages re-warped from the photos with a margin around the crop')
     p.add_argument('record', type=Path, help='The .scan.json written by build')
