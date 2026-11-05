@@ -83,7 +83,11 @@ with the paper).
 
 Known limits: a page edge is fitted with a straight line, so a strongly curled
 page keeps a sliver of background at the corners or loses a few pixels of paper.
-Writing that is outside the photo cannot be recovered.
+On the hand-held thin notebook the tight outer edges clipped dates written right at
+the margin or the bottom of the last line on 6 of 91 pages; `compare` shows such
+cases, and `bleed_px` on those pages keeps the writing. On the thick notebook
+snapping can take the white edges of the sheets underneath into the top-left
+corner (about 1 % of the page). Writing that is outside the photo cannot be recovered.
 
 ## Tests
 
