@@ -197,12 +197,18 @@ def crease(full, quad):
     rows = np.arange(int(.04 * H), int(.96 * H), 4)
     sampled = response[rows]
     tilts = np.arange(-int(.05 * W), int(.05 * W) + 1, 2)
-    columns = np.arange(n)
     table = np.zeros((len(tilts), n))
     for i, tilt in enumerate(tilts):
-        index = columns[None, :] + np.round(tilt * rows / H).astype(int)[:, None]
-        inside = (index >= 0) & (index < n)
-        table[i] = (np.take_along_axis(sampled, np.clip(index, 0, n - 1), 1) * inside).mean(0)
+        # mean along the tilted line: rows with the same rounded shift move as one block
+        shift = np.round(tilt * rows / H).astype(int)
+        moved = np.zeros_like(sampled)
+        for step in np.unique(shift):
+            group = shift == step
+            if step >= 0:
+                moved[group, :n - step] = sampled[group, step:]
+            else:
+                moved[group, -step:] = sampled[group, :n + step]
+        table[i] = moved.mean(0)
     best = table.argmax(0)
     centre = X + tilts[best] / 2
     score = table.max(0) * np.exp(-.5 * ((centre - .5 * W) / (.03 * W)) ** 2)
@@ -366,6 +372,8 @@ def refine(small, full, mask, quad, spread, margin=.06):
         outline_quad = np.float32(quad) / scale
         whole_top = fit(*edge('top', mx + .04 * W, mx + .96 * W), 1)
         whole_bottom = fit(*edge('bottom', mx + .04 * W, mx + .96 * W), -1, 50)
+        if max(clipped, default=0) > .2 and margin < .2:      # before the costly crease search
+            return refine(small, full, mask, quad, spread, margin + .07)
         if None not in (whole_top, whole_bottom, left, right):
             corners = [meet(whole_top, left), meet(whole_top, right),
                        meet(whole_bottom, right), meet(whole_bottom, left)]
