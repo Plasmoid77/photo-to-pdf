@@ -264,14 +264,17 @@ def crease(full, quad):
     return top, bottom, info, flags
 
 
-def refine(small, full, mask, quad, spread):
+def refine(small, full, mask, quad, spread, margin=.06):
     """Per-page quads from paper edges in the rectified draft frame.
 
     Paper-mask edge samples are snapped to the strongest step from paper to a clearly darker
     background within 2 % of the frame width (pale stacked sheets or skin keep the mask edge), then fitted with robust straight lines: top and outer sides
     tight (90 % of the edge outside the line), bottom by the median, because writing often reaches
-    the lower edge. For a spread, `crease` finds the gutter inside the fitted outline; both
-    pages overlap it slightly.
+    the lower edge. A fitted edge then moves outward over pen strokes lying between it and the
+    outermost paper line (by at most 4 % of the page width; beyond that the page is flagged
+    `margin-ink`). For a spread, `crease` finds the gutter inside the fitted outline; both pages
+    overlap it slightly. When the paper of a curved page runs past the frame around the draft
+    outline, the search is repeated with a wider frame.
     """
     import cv2
     import numpy as np
@@ -279,7 +282,7 @@ def refine(small, full, mask, quad, spread):
     height = (np.linalg.norm(quad[3] - quad[0]) + np.linalg.norm(quad[2] - quad[1])) / 2
     W = 2400 if spread else 1600
     H = max(200, round(W * height / max(width, 1)))
-    mx, my = round(.06 * W), round(.06 * H)
+    mx, my = round(margin * W), round(margin * H)
     frame = np.float32([[mx, my], [mx + W, my], [mx + W, my + H], [mx, my + H]])
     matrix = cv2.getPerspectiveTransform(np.float32(quad), frame)
     size = (W + 2 * mx, H + 2 * my)
@@ -288,7 +291,17 @@ def refine(small, full, mask, quad, spread):
     sheet = cv2.warpPerspective(mask, matrix, size, flags=cv2.INTER_NEAREST) > 127
     gray = cv2.GaussianBlur(cv2.warpPerspective(cv2.cvtColor(full, cv2.COLOR_RGB2GRAY), to_frame, size,
                                                 flags=cv2.INTER_AREA).astype('float32'), (0, 0), 1.5)
+    # pen strokes: thin, darker than the paper around them and bluer than its local tint (ruling is
+    # pale, the red margin line is not bluer, the paper tint follows the lighting, a cover edge is wide)
+    colour = cv2.warpPerspective(full, to_frame, size, flags=cv2.INTER_AREA)
+    tint = colour[..., 2].astype('float32') - colour[..., 1]
+    ink = ((cv2.morphologyEx(cv2.cvtColor(colour, cv2.COLOR_RGB2GRAY), cv2.MORPH_BLACKHAT,
+                             np.ones((11, 11), 'uint8')) > 40)
+           & (tint - cv2.blur(tint, (41, 41)) > 15)
+           & (cv2.erode(sheet.astype('uint8'), np.ones((9, 9), 'uint8')) > 0))
+    ink_y, ink_x = np.nonzero(ink)
     reach = round(.02 * W)
+    widened, clipped, capped = [], [], []
     def edge(name, start, stop):
         steps = np.arange(round(start), round(stop), 4)
         if name == 'top':
@@ -307,6 +320,9 @@ def refine(small, full, mask, quad, spread):
             found = low + band.shape[0] - 1 - band[::-1].argmax(0)
         hit = band.any(0)
         steps, found = steps[hit], found[hit]
+        if hit.any():
+            border = {'top': 0, 'left': 0, 'bottom': sheet.shape[0] - 1, 'right': sheet.shape[1] - 1}[name]
+            clipped.append(float(np.mean(found == border)))
         outward = -1 if name in ('top', 'left') else 1
         along = gray if name in ('left', 'right') else gray.T
         limit = along.shape[1] - 1
@@ -320,8 +336,31 @@ def refine(small, full, mask, quad, spread):
         strong = contrast[np.arange(len(steps)), best] >= 25
         found = np.where(strong, position[np.arange(len(steps)), best], found)
         return steps, found
-    left = fit(*edge('left', my + .08 * H, my + .92 * H), 1)
-    right = fit(*edge('right', my + .08 * H, my + .92 * H), -1)
+    def guard(line, samples, inward, name, start, stop, label):
+        """Move a fitted edge outward over blue ink lying between it and the outermost paper line."""
+        if line is None:
+            return None
+        a, b = line
+        outward = -inward
+        room = outward * (fit(*samples, inward, 5)[1] - b)
+        t, v = (ink_x, ink_y) if name in ('top', 'bottom') else (ink_y, ink_x)
+        span = (t >= start) & (t < stop)
+        d = outward * (v[span] - (a * t[span] + b))
+        d = d[(d > 0) & (d <= room)]
+        if room < 2 or d.size < 15:
+            return line
+        widened.append(label)
+        shift = np.percentile(d, 98) + 4
+        cap = .04 * (W / 2 if spread else W)
+        if min(shift, room) > cap:
+            capped.append(label)
+        return a, b + outward * min(shift, room, cap)
+    def side_line(name, start, stop, inward, span, percentile=90):
+        samples = edge(name, start, stop)
+        line = fit(*samples, inward, percentile)
+        return line, (lambda label: guard(line, samples, inward, name, *span, label))
+    left, guard_left = side_line('left', my + .08 * H, my + .92 * H, 1, (my, my + H))
+    right, guard_right = side_line('right', my + .08 * H, my + .92 * H, -1, (my, my + H))
     info, flags = {}, []
     if spread:
         outline_quad = np.float32(quad) / scale
@@ -338,15 +377,16 @@ def refine(small, full, mask, quad, spread):
         offset = ends[0][0] - slope * ends[0][1]
         overlap = .0015 * W
         xs = [slope * y + offset for y in (my, my + H)]
-        spans = [('L', mx + .04 * W, min(xs) - .07 * W, left, (slope, offset + overlap)),
-                 ('R', max(xs) + .07 * W, mx + .96 * W, (slope, offset - overlap), right)]
+        spans = [('L', mx + .04 * W, min(xs) - .07 * W, guard_left('L-left'), (slope, offset + overlap)),
+                 ('R', max(xs) + .07 * W, mx + .96 * W, (slope, offset - overlap), guard_right('R-right'))]
     else:
-        spans = [('P', mx + .06 * W, mx + .94 * W, left, right)]
+        spans = [('P', mx + .06 * W, mx + .94 * W, guard_left('P-left'), guard_right('P-right'))]
     inverse = np.linalg.inv(matrix)
     pages = []
     for side, start, stop, outer_left, outer_right in spans:
-        top = fit(*edge('top', start, stop), 1)
-        bottom = fit(*edge('bottom', start, stop), -1, 50)
+        _, guard_top = side_line('top', start, stop, 1, (start, stop))
+        _, guard_bottom = side_line('bottom', start, stop, -1, (start, stop), 50)
+        top, bottom = guard_top(f'{side}-top'), guard_bottom(f'{side}-bottom')
         if None in (top, bottom, outer_left, outer_right):
             return None, info, flags
         corners = [meet(top, outer_left), meet(top, outer_right),
@@ -355,6 +395,12 @@ def refine(small, full, mask, quad, spread):
         if not cv2.isContourConvex(points) or cv2.contourArea(points) < .25 * cv2.contourArea(np.float32(quad)):
             return None, info, flags
         pages.append((side, points))
+    if max(clipped, default=0) > .2 and margin < .2:
+        return refine(small, full, mask, quad, spread, margin + .07)
+    if widened:
+        info = dict(info, margin_ink=widened)
+    if capped:
+        flags = flags + ['margin-ink']
     return pages, info, flags
 
 
@@ -385,8 +431,9 @@ def guess(image, layout):
         except (ValueError, IndexError, ZeroDivisionError, np.linalg.LinAlgError, cv2.error):
             pages = None
         if pages:
-            return ([(s, q / norm) for s, q in pages], 'edges+gutter' if spread else 'edges',
-                    info, flags)
+            cut = frame_cut(mask, pages)
+            return ([(s, q / norm, ['touches-frame'] if s in cut else []) for s, q in pages],
+                    'edges+gutter' if spread else 'edges', info, flags)
     flags = flags + [method]
     if spread:
         tl, tr, br, bl = quad
@@ -394,9 +441,29 @@ def guess(image, layout):
         pages = [('L', np.array([tl, top, bottom, bl])), ('R', np.array([top, tr, br, bottom]))]
     else:
         pages = [('P', quad)]
-    return [(s, q / norm) for s, q in pages], method, info, flags
+    return [(s, q / norm, []) for s, q in pages], method, info, flags
 
 
+def frame_cut(mask, pages):
+    """Sides of pages whose paper runs into the photo border (part of the page may be outside)."""
+    import numpy as np
+    h, w = mask.shape
+    paper = mask > 127
+    borders = [(paper[0], 0, 0), (paper[-1], 0, 1), (paper[:, 0], 1, 0), (paper[:, -1], 1, 1)]
+    cut = set()
+    for side, quad in pages:
+        quad = np.asarray(quad, float)
+        for line, axis, far in borders:
+            # top/bottom borders: the page's column range; left/right: its row range
+            values = quad[:, 0] if axis == 0 else quad[:, 1]
+            a, b = int(max(values.min(), 0)), int(min(values.max(), len(line) - 1))
+            if b - a < 10:
+                continue
+            near = quad[:, 1] / h if axis == 0 else quad[:, 0] / w
+            distance = (1 - near.max()) if far else near.min()
+            if line[a:b].mean() > .03 and distance < .15:
+                cut.add(side)
+    return cut
 def physical_aspect(page, size):
     """Width/height of a quad from its side lengths in pixels."""
     import numpy as np
@@ -429,10 +496,10 @@ def prepare(args):
         checksum = digest(path)
         image.thumbnail((1100, 1100))
         draw = ImageDraw.Draw(image)
-        for side, points in choices:
+        for side, points, extra in choices:
             item = dict(id=f'{number:04d}-{side}', source=str(path.resolve()), sha256=checksum,
                         quad=np.round(points, 5).tolist(), aspect=None, bleed_px=0, enhance=True,
-                        include=True, reviewed=False, detection=method, flags=list(flags), **info)
+                        include=True, reviewed=False, detection=method, flags=list(flags) + extra, **info)
             if checksum in seen:
                 item['duplicate_of'] = seen[checksum]
                 item['flags'].append('duplicate')
@@ -440,14 +507,14 @@ def prepare(args):
             outline = [tuple(p * image.size) for p in points]
             colour = {'L': (255, 40, 20), 'R': (0, 170, 0)}.get(side, (230, 0, 230))
             draw.line(outline + outline[:1], fill=colour, width=3)
-            draw.text(outline[0], item['id'] + (' CHECK' if flags else ''), fill=colour)
+            draw.text(outline[0], item['id'] + (' CHECK' if item['flags'] else ''), fill=colour)
         seen[checksum] = str(path.resolve())
         preview = work / f'source-{number:03d}.jpg'
         image.save(preview, quality=92)
         previews.append(preview)
     for page in pages:
         q = np.float64(page['quad'])
-        if (q < .003).any() or (q > .997).any():
+        if ((q < .003).any() or (q > .997).any()) and 'touches-frame' not in page['flags']:
             page['flags'].append('touches-frame')
     sides = {p['id']: p for p in pages}
     for page in pages:

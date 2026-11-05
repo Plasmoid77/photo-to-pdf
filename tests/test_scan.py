@@ -43,23 +43,38 @@ def page_texture(rng, ruled=True, ink=True, colour=(236, 233, 224)):
     return page
 
 
-def spread_photo(rng, shadow=False, crease=True, cover_right=False, background=(35, 30, 28)):
-    """A two-page spread warped into a 3200 x 2200 photo. Returns RGB image and true quads (L, R)."""
+def spread_photo(rng, shadow=False, crease=True, cover_right=False, background=(35, 30, 28), bulge=0,
+                 date=False):
+    """A two-page spread warped into a 3200 x 2200 photo. Returns RGB image and true quads (L, R).
+
+    `bulge` curves the outer edge of the left page outward by up to that many px (mid-height);
+    `date` writes a blue mark in that bulge, outside the straight page rectangle.
+    """
     flat = np.concatenate([page_texture(rng),
                            page_texture(rng, ruled=False, ink=False, colour=(205, 195, 175)) if cover_right
                            else page_texture(rng)], axis=1)
+    if bulge:
+        extra = np.zeros((PAGE_H, bulge, 3), np.uint8)
+        extra[:] = background
+        for y in range(PAGE_H):
+            extra[y, bulge - int(round(bulge * np.sin(np.pi * y / PAGE_H))):] = (236, 233, 224)
+        if date:
+            for x in range(bulge - 50, bulge - 8, 12):
+                cv2.line(extra, (x, PAGE_H // 2 - 40), (x + 6, PAGE_H // 2 + 40), (40, 60, 150), 3)
+        flat = np.concatenate([extra, flat], axis=1)
     if shadow:
         x = np.arange(2 * PAGE_W, dtype=float)
         dark = np.where(x < PAGE_W, np.exp(-(PAGE_W - x) / 45.) * 70, np.exp(-(x - PAGE_W) / 8.) * 25)
         flat = np.clip(flat - dark[None, :, None], 0, 255).astype(np.uint8)
     if crease:
-        flat[:, PAGE_W - 1:PAGE_W + 1] = (120, 110, 100)
+        flat[:, bulge + PAGE_W - 1:bulge + PAGE_W + 1] = (120, 110, 100)
     photo = np.zeros((2200, 3200, 3), np.uint8)
     photo[:] = background
     corners = np.float32([[0, 0], [2 * PAGE_W, 0], [2 * PAGE_W, PAGE_H], [0, PAGE_H]])
     target = np.float32([[420, 260], [2900, 300], [2960, 1960], [360, 1900]])
     matrix = cv2.getPerspectiveTransform(corners, target)
-    cv2.warpPerspective(flat, matrix, (3200, 2200), photo, borderMode=cv2.BORDER_TRANSPARENT,
+    shift = np.array([[1, 0, -bulge], [0, 1, 0], [0, 0, 1]], float)
+    cv2.warpPerspective(flat, matrix @ shift, (3200, 2200), photo, borderMode=cv2.BORDER_TRANSPARENT,
                         flags=cv2.INTER_LINEAR)
     def project(points):
         return cv2.perspectiveTransform(np.float32(points).reshape(-1, 1, 2), matrix)[:, 0] / [3200, 2200]
@@ -114,6 +129,24 @@ class Detection(unittest.TestCase):
         manifest = self.prepare()
         flags = {f for p in manifest['pages'] for f in p['flags']}
         self.assertIn('one-side-unruled', flags)
+
+    def test_margin_ink_widens_only_that_edge(self):
+        # a curved outer edge stays tight, unless writing lies in the curved strip
+        for name, date in (('01-plain.jpg', False), ('02-date.jpg', True)):
+            image, left, _ = spread_photo(self.rng, bulge=70, date=date)
+            self.save(name, image)
+        pages = {(Path(p['source']).name, p['id'][-1]): p for p in self.prepare()['pages']}
+        plain, dated = pages[('01-plain.jpg', 'L')], pages[('02-date.jpg', 'L')]
+        self.assertNotIn('L-left', plain.get('margin_ink', []))
+        self.assertIn('L-left', dated.get('margin_ink', []))
+        def left_edge(page):          # x of the left edge at mid-height, photo px
+            quad = np.float64(page['quad']) * [3200, 2200]
+            return (quad[0][0] + quad[3][0]) / 2
+        # the tight edge lies near the inner part of the 70 px arc (about 26 px out); the date sits
+        # 2-50 px out and the widened edge keeps all of it
+        straight = (left[0][0] + left[3][0]) / 2 * 3200
+        self.assertGreater(left_edge(plain), straight - 35)
+        self.assertLess(left_edge(dated), straight - 45)
 
     def test_eval_against_reference(self):
         image, left, right = spread_photo(self.rng, shadow=True)
