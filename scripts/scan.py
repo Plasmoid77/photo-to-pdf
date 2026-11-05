@@ -124,19 +124,26 @@ def outline(mask):
 
 
 def fit(t, v, inward, percentile=90):
-    """Robust line v = a*t + b, moved inward until `percentile`% of edge samples lie outside it."""
+    """Robust line v = a*t + b, moved inward until `percentile`% of edge samples lie outside it.
+
+    Outliers (fingers, shadows, notches) are rejected iteratively, but at least 30 % of the samples
+    stay in the fit, so a gently curved edge is approximated instead of rejected.
+    """
     import numpy as np
     t, v = np.asarray(t, float), np.asarray(v, float)
+    if len(t) < 20:
+        return None
     keep = np.ones(len(t), bool)
     for _ in range(5):
-        if keep.sum() < 20:
-            return None
         a, b = np.polyfit(t[keep], v[keep], 1)
         residual = v - (a * t + b)
-        spread = 1.4826 * np.median(np.abs(residual[keep] - np.median(residual[keep]))) + .5
-        keep = np.abs(residual) < 3 * spread
-    if keep.sum() < 20:
-        return None
+        spread = max(1.4826 * np.median(np.abs(residual[keep] - np.median(residual[keep]))), 2.)
+        narrower = np.abs(residual) < 3 * spread
+        if narrower.sum() < max(20, .3 * len(t)):
+            break
+        keep = narrower
+    a, b = np.polyfit(t[keep], v[keep], 1)
+    residual = v - (a * t + b)
     return a, b + inward * np.percentile(inward * residual[keep], percentile)
 
 
@@ -147,12 +154,123 @@ def meet(horizontal, vertical):
     return [c * y + d, y]
 
 
-def refine(small, full, mask, quad, spread):
-    """Per-page quads from edge lines in the rectified draft frame.
+CREASE_BANDS = ((.04, .24), (.40, .60), (.76, .96))
 
-    Top and outer edges: tight (90% of the paper edge lies outside the line); bottom: median line,
-    because writing often reaches the lower edge. Gutter: the shadow valley is usually on one page,
-    so the fold is the steepest brightness step next to it, measured on the full-resolution photo.
+
+def crease(full, quad):
+    """Gutter of a two-page spread.
+
+    `quad` is the spread outline (TL, TR, BR, BL) in full-resolution pixels. Within the central
+    band of the rectified spread the darkest straight (possibly tilted) line is found on the blue
+    channel with ink and bluish ruling suppressed. On a thin notebook that line is the crease
+    itself. When it lies in a deep shadow, the crease is the foot of the steepest brightness step
+    next to it, on its dark side: the shadow belongs to one page and the step is where the other
+    page begins (30 % of the peak slope). Returns (top, bottom) points in full-resolution pixels, info and flags.
+    """
+    import cv2
+    import numpy as np
+    quad = np.float32(quad)
+    W = int(round((np.linalg.norm(quad[1] - quad[0]) + np.linalg.norm(quad[2] - quad[3])) / 2))
+    H = int(round((np.linalg.norm(quad[3] - quad[0]) + np.linalg.norm(quad[2] - quad[1])) / 2))
+    matrix = cv2.getPerspectiveTransform(quad, np.float32([[0, 0], [W, 0], [W, H], [0, H]]))
+    low, high, pad = int(.36 * W), int(.64 * W), 60
+    shift = np.array([[1, 0, pad - low], [0, 1, 0], [0, 0, 1]], float) @ matrix
+    band = cv2.warpPerspective(full, shift, (high - low + 2 * pad, H), flags=cv2.INTER_AREA)
+    n = band.shape[1]
+    X = np.arange(n) + low - pad
+    hsv = cv2.cvtColor(band, cv2.COLOR_RGB2HSV)
+    blue = band[..., 2].astype('float32')
+    ratio = blue / np.maximum(band[..., 0].astype('float32'), 1)
+    neutral = cv2.medianBlur(np.clip(ratio * 200, 0, 255).astype('uint8'), 31).astype('float32') / 200
+    ink = (hsv[..., 1] > 70) | (ratio > neutral + .012)
+    plain = blue.copy()
+    plain[ink] = cv2.medianBlur(band[..., 2], 21).astype('float32')[ink]
+    plain = cv2.GaussianBlur(plain, (0, 0), 1.2)
+    background = np.zeros_like(plain)
+    for radius in (6, 12, 30):
+        side = np.zeros_like(plain)
+        side[:, radius:-radius] = (plain[:, :-2 * radius] + plain[:, 2 * radius:]) / 2
+        background = np.maximum(background, side)
+    response = cv2.blur(np.clip(background - plain, 0, 60), (5, 1))
+    response[:, :pad] = 0
+    response[:, -pad:] = 0
+    rows = np.arange(int(.04 * H), int(.96 * H), 4)
+    sampled = response[rows]
+    tilts = np.arange(-int(.05 * W), int(.05 * W) + 1, 2)
+    columns = np.arange(n)
+    table = np.zeros((len(tilts), n))
+    for i, tilt in enumerate(tilts):
+        index = columns[None, :] + np.round(tilt * rows / H).astype(int)[:, None]
+        inside = (index >= 0) & (index < n)
+        table[i] = (np.take_along_axis(sampled, np.clip(index, 0, n - 1), 1) * inside).mean(0)
+    best = table.argmax(0)
+    centre = X + tilts[best] / 2
+    score = table.max(0) * np.exp(-.5 * ((centre - .5 * W) / (.03 * W)) ** 2)
+    k = int(np.argmax(score))
+    tilt = int(tilts[best[k]])
+    left, right = k, k
+    while left > 0 and score[left - 1] > .7 * score[k]:
+        left -= 1
+    while right < n - 1 and score[right + 1] > .7 * score[k]:
+        right += 1
+    rest = np.concatenate([score[:max(0, left - 8)], score[right + 9:]])
+    ambiguity = float(rest.max() / max(score[k], 1e-9)) if rest.size else 0.
+    line = np.round(k + tilt * rows / H).astype(int)
+    valid = (line > 32) & (line < n - 32)
+    depth = float(np.median(((plain[rows, line - 30] + plain[rows, line + 30]) / 2
+                             - plain[rows, line])[valid])) if valid.any() else 0.
+    xs, ys = [], []
+    for top, bottom in CREASE_BANDS:
+        y = (top + bottom) / 2 * H
+        x = int(round(k + tilt * y / H))
+        if depth >= 15:
+            profile = np.median(plain[int(top * H):int(bottom * H)], axis=0)
+            gradient = np.gradient(cv2.GaussianBlur(profile.reshape(1, -1), (0, 0), 2).ravel())
+            a, b = max(2, x - 45), min(n - 2, x + 46)
+            q = a + int(np.argmax(np.abs(gradient[a:b])))
+            sign, peak = np.sign(gradient[q]), abs(gradient[q])
+            step = -1 if sign > 0 else 1
+            while a < q < b and sign * gradient[q] > .3 * peak:
+                q += step
+            x = q
+        xs.append(X[min(max(x, 0), n - 1)])
+        ys.append(y)
+    xs, ys = np.float64(xs), np.float64(ys)
+    slope, offset = np.polyfit(ys, xs, 1)
+    error = np.abs(xs - (slope * ys + offset))
+    if error.max() > .004 * W:
+        keep = np.argsort(error)[:2]
+        slope, offset = np.polyfit(ys[keep], xs[keep], 1)
+    flags = []
+    if abs(slope * H / 2 + offset - .5 * W) > .07 * W:
+        flags.append('gutter-off-centre')
+    if ambiguity > .85:
+        flags.append('gutter-ambiguous')
+    if np.sort(np.abs(xs - (slope * ys + offset)))[1] > .004 * W:
+        flags.append('gutter-bands-disagree')
+    gray = cv2.warpPerspective(cv2.cvtColor(full, cv2.COLOR_RGB2GRAY), matrix, (W, H),
+                               flags=cv2.INTER_AREA).astype('float32')
+    detail = gray - cv2.GaussianBlur(gray, (0, 0), 8)
+    def ruling(a, b):
+        return float(detail[int(.1 * H):int(.9 * H), int(a * W):int(b * W)].mean(1).std())
+    texture = sorted([ruling(.12, .4), ruling(.6, .88)])
+    if texture[0] < .35 * texture[1]:
+        flags.append('one-side-unruled')
+    ends = np.float32([[offset, 0], [slope * H + offset, H]]).reshape(-1, 1, 2)
+    top, bottom = cv2.perspectiveTransform(ends, np.linalg.inv(matrix))[:, 0]
+    info = dict(gutter_method='shadow' if depth >= 15 else 'line', gutter_depth=round(depth, 1),
+                gutter_ambiguity=round(ambiguity, 2))
+    return top, bottom, info, flags
+
+
+def refine(small, full, mask, quad, spread):
+    """Per-page quads from paper edges in the rectified draft frame.
+
+    Paper-mask edge samples are snapped to the strongest step from paper to a clearly darker
+    background within 2 % of the frame width (pale stacked sheets or skin keep the mask edge), then fitted with robust straight lines: top and outer sides
+    tight (90 % of the edge outside the line), bottom by the median, because writing often reaches
+    the lower edge. For a spread, `crease` finds the gutter inside the fitted outline; both
+    pages overlap it slightly.
     """
     import cv2
     import numpy as np
@@ -164,7 +282,12 @@ def refine(small, full, mask, quad, spread):
     frame = np.float32([[mx, my], [mx + W, my], [mx + W, my + H], [mx, my + H]])
     matrix = cv2.getPerspectiveTransform(np.float32(quad), frame)
     size = (W + 2 * mx, H + 2 * my)
+    scale = small.shape[1] / full.shape[1]
+    to_frame = matrix @ np.diag([scale, scale, 1])
     sheet = cv2.warpPerspective(mask, matrix, size, flags=cv2.INTER_NEAREST) > 127
+    gray = cv2.GaussianBlur(cv2.warpPerspective(cv2.cvtColor(full, cv2.COLOR_RGB2GRAY), to_frame, size,
+                                                flags=cv2.INTER_AREA).astype('float32'), (0, 0), 1.5)
+    reach = round(.02 * W)
     def edge(name, start, stop):
         steps = np.arange(round(start), round(stop), 4)
         if name == 'top':
@@ -182,35 +305,38 @@ def refine(small, full, mask, quad, spread):
             band = sheet[steps, low:].T
             found = low + band.shape[0] - 1 - band[::-1].argmax(0)
         hit = band.any(0)
-        return steps[hit], found[hit]
+        steps, found = steps[hit], found[hit]
+        outward = -1 if name in ('top', 'left') else 1
+        along = gray if name in ('left', 'right') else gray.T
+        limit = along.shape[1] - 1
+        offsets = np.arange(-reach, reach + 1)
+        position = np.clip(found[:, None] + offsets[None, :], 4, limit - 4)
+        rows = steps[:, None]
+        inner = along[rows, position - 3 * outward]
+        outer = along[rows, position + 3 * outward]
+        contrast = np.where(outer < .75 * inner, inner - outer, 0)
+        best = contrast.argmax(1)
+        strong = contrast[np.arange(len(steps)), best] >= 25
+        found = np.where(strong, position[np.arange(len(steps)), best], found)
+        return steps, found
     left = fit(*edge('left', my + .08 * H, my + .92 * H), 1)
     right = fit(*edge('right', my + .08 * H, my + .92 * H), -1)
-    info = {}
+    info, flags = {}, []
     if spread:
-        scale = small.shape[1] / full.shape[1]
-        gray = cv2.cvtColor(cv2.warpPerspective(full, matrix @ np.diag([scale, scale, 1]), size),
-                            cv2.COLOR_RGB2GRAY).astype('float32')
-        def column(a, b, sigma):
-            row = np.median(gray[my + round(a * H):my + round(b * H)], axis=0)
-            return cv2.GaussianBlur(row.reshape(1, -1), (0, 0), sigma).ravel()
-        def valley(row, low, high, reach=30):
-            depth = row[low:high] - (row[low - reach:high - reach] + row[low + reach:high + reach]) / 2
-            return low + int(np.argmin(depth)), float(depth.min())
-        centre, depth = valley(column(.1, .9, 3), mx + round(.4 * W), mx + round(.6 * W))
-        info['gutter_contrast'] = round(-depth, 1)
-        reach, ys, xs = round(.025 * W), [], []
-        for a, b in [(.03, .25), (.4, .6), (.75, .97)]:
-            shadow = valley(column(a, b, 3), centre - reach, centre + reach)[0]
-            step = np.abs(np.gradient(column(a, b, 2))[shadow - 45:shadow + 45])
-            xs.append(shadow - 45 + int(np.argmax(step)))
-            ys.append(my + (a + b) / 2 * H)
-        ys, xs = np.float64(ys), np.float64(xs)
-        slope, offset = np.polyfit(ys, xs, 1)
-        error = np.abs(xs - (slope * ys + offset))
-        if error.max() > 12:
-            best = np.argsort(error)[:2]
-            slope, offset = np.polyfit(ys[best], xs[best], 1)
+        outline_quad = np.float32(quad) / scale
+        whole_top = fit(*edge('top', mx + .04 * W, mx + .96 * W), 1)
+        whole_bottom = fit(*edge('bottom', mx + .04 * W, mx + .96 * W), -1, 50)
+        if None not in (whole_top, whole_bottom, left, right):
+            corners = [meet(whole_top, left), meet(whole_top, right),
+                       meet(whole_bottom, right), meet(whole_bottom, left)]
+            outline_quad = cv2.perspectiveTransform(np.float32(corners).reshape(-1, 1, 2),
+                                                    np.linalg.inv(to_frame))[:, 0]
+        top, bottom, info, flags = crease(full, outline_quad)
+        ends = cv2.perspectiveTransform(np.float32([top, bottom]).reshape(-1, 1, 2), to_frame)[:, 0]
+        slope = (ends[1][0] - ends[0][0]) / (ends[1][1] - ends[0][1])
+        offset = ends[0][0] - slope * ends[0][1]
         overlap = .0015 * W
+        xs = [slope * y + offset for y in (my, my + H)]
         spans = [('L', mx + .04 * W, min(xs) - .07 * W, left, (slope, offset + overlap)),
                  ('R', max(xs) + .07 * W, mx + .96 * W, (slope, offset - overlap), right)]
     else:
@@ -221,18 +347,18 @@ def refine(small, full, mask, quad, spread):
         top = fit(*edge('top', start, stop), 1)
         bottom = fit(*edge('bottom', start, stop), -1, 50)
         if None in (top, bottom, outer_left, outer_right):
-            return None, info
+            return None, info, flags
         corners = [meet(top, outer_left), meet(top, outer_right),
                    meet(bottom, outer_right), meet(bottom, outer_left)]
         points = cv2.perspectiveTransform(np.float32(corners).reshape(-1, 1, 2), inverse)[:, 0]
         if not cv2.isContourConvex(points) or cv2.contourArea(points) < .25 * cv2.contourArea(np.float32(quad)):
-            return None, info
+            return None, info, flags
         pages.append((side, points))
-    return pages, info
+    return pages, info, flags
 
 
 def guess(image, layout):
-    """Draft per-page quads (normalized) for one photo: [(side, quad)], method, extra fields."""
+    """Draft per-page quads (normalized) for one photo: [(side, quad)], method, info, flags."""
     import cv2
     import numpy as np
     w, h = image.size
@@ -251,24 +377,32 @@ def guess(image, layout):
         quad, method = outline(mask), 'contour'
     ratio = np.linalg.norm(quad[1] - quad[0]) / max(np.linalg.norm(quad[3] - quad[0]), 1)
     spread = layout == 'spreads' or (layout == 'auto' and ratio > 1.25)
-    extra = {}
+    info, flags = {}, []
     if mask is not None:
         try:
-            pages, extra = refine(small, full, mask, quad, spread)
+            pages, info, flags = refine(small, full, mask, quad, spread)
         except (ValueError, IndexError, ZeroDivisionError, np.linalg.LinAlgError, cv2.error):
             pages = None
         if pages:
-            method = 'edges+gutter' if spread else 'edges'
-            if spread and extra.get('gutter_contrast', 0) < 10:
-                method += '-uncertain'
-            return [(s, q / norm) for s, q in pages], method, extra
+            return ([(s, q / norm) for s, q in pages], 'edges+gutter' if spread else 'edges',
+                    info, flags)
+    flags = flags + [method]
     if spread:
         tl, tr, br, bl = quad
         top, bottom = (tl + tr) / 2, (bl + br) / 2
         pages = [('L', np.array([tl, top, bottom, bl])), ('R', np.array([top, tr, br, bottom]))]
     else:
         pages = [('P', quad)]
-    return [(s, q / norm) for s, q in pages], method, extra
+    return [(s, q / norm) for s, q in pages], method, info, flags
+
+
+def physical_aspect(page, size):
+    """Width/height of a quad from its side lengths in pixels."""
+    import numpy as np
+    q = np.float64(page['quad']) * size
+    width = (np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])) / 2
+    height = (np.linalg.norm(q[3] - q[0]) + np.linalg.norm(q[2] - q[1])) / 2
+    return width / max(height, 1)
 
 
 def prepare(args):
@@ -286,31 +420,61 @@ def prepare(args):
     sources = sorted((p for p in root.iterdir() if p.is_file() and p.suffix.lower() in extensions), key=key)
     if not sources:
         fail(f'No supported photographs: {root}')
-    pages, previews, seen = [], [], {}
+    pages, previews, seen, sizes = [], [], {}, {}
     for number, path in enumerate(sources, 1):
         image = photo(path)
-        choices, method, extra = guess(image, args.layout)
+        sizes[str(path.resolve())] = image.size
+        choices, method, info, flags = guess(image, args.layout)
         checksum = digest(path)
         image.thumbnail((1100, 1100))
         draw = ImageDraw.Draw(image)
         for side, points in choices:
             item = dict(id=f'{number:04d}-{side}', source=str(path.resolve()), sha256=checksum,
                         quad=np.round(points, 5).tolist(), aspect=None, bleed_px=0, enhance=True,
-                        include=True, reviewed=False, detection=method, **extra)
+                        include=True, reviewed=False, detection=method, flags=list(flags), **info)
             if checksum in seen:
                 item['duplicate_of'] = seen[checksum]
+                item['flags'].append('duplicate')
             pages.append(item)
             outline = [tuple(p * image.size) for p in points]
             colour = {'L': (255, 40, 20), 'R': (0, 170, 0)}.get(side, (230, 0, 230))
             draw.line(outline + outline[:1], fill=colour, width=3)
-            draw.text(outline[0], item['id'], fill=colour)
+            draw.text(outline[0], item['id'] + (' CHECK' if flags else ''), fill=colour)
         seen[checksum] = str(path.resolve())
         preview = work / f'source-{number:03d}.jpg'
         image.save(preview, quality=92)
         previews.append(preview)
+    for page in pages:
+        q = np.float64(page['quad'])
+        if (q < .003).any() or (q > .997).any():
+            page['flags'].append('touches-frame')
+    sides = {p['id']: p for p in pages}
+    for page in pages:
+        partner = sides.get(page['id'][:-1] + 'R') if page['id'].endswith('-L') else None
+        if partner is None:
+            continue
+        size = np.float64(sizes[page['source']])
+        a, b = np.float64(page['quad']) * size, np.float64(partner['quad']) * size
+        def taper(q):
+            return np.linalg.norm(q[1] - q[0]) / np.linalg.norm(q[2] - q[3])
+        def width(q):
+            return np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])
+        if abs(np.log(taper(a) / taper(b))) > .1 or abs(np.log(width(a) / width(b))) > .12:
+            page['flags'].append('partner-mismatch')
+            partner['flags'].append('partner-mismatch')
+    for kind in ('P', 'LR'):
+        group = [p for p in pages if p['id'][-1] in kind]
+        if len(group) >= 5:
+            aspects = np.array([physical_aspect(p, sizes[p['source']]) for p in group])
+            middle = np.median(aspects)
+            for page, value in zip(group, aspects):
+                if abs(value / middle - 1) > .08:
+                    page['flags'].append('aspect-outlier')
     dump(work / 'manifest.json', dict(version=1, pages=pages))
     contact(previews, work, 'sources')
-    print(f'{len(sources)} photographs; {len(pages)} draft pages. Review manifest and outlines.')
+    flagged = [p['id'] for p in pages if p['flags']]
+    print(f'{len(sources)} photographs; {len(pages)} draft pages; {len(flagged)} flagged for a close check'
+          + (f": {', '.join(flagged)}" if flagged else '') + '. Review every outline anyway.')
 
 
 def light(array):
@@ -471,7 +635,223 @@ def review(args):
     if not paths:
         fail('No pages rendered.')
     contact(paths, work, 'pages')
+    rows = edge_metrics(paths)
+    dump(work / 'edges.json', rows)
+    suspects = []
+    for row in rows:
+        notes = [f'{k} dark {v} %' for k, v in row['dark'].items() if v > args.dark_limit]
+        notes += [f'{k} ink {v} %' for k, v in row['ink'].items() if v > args.ink_limit]
+        if notes:
+            suspects.append(f"  page {row['page']}: " + ', '.join(notes))
     print(f'{len(paths)} pages rendered; inspect ALL sheets and individual edge exceptions: {work}')
+    if suspects:
+        print(f'{len(suspects)} pages with background or writing at a border (compare them with the photos):')
+        print('\n'.join(suspects))
+
+
+def oriented_size(path):
+    """(width, height) after EXIF orientation, without decoding pixels."""
+    from PIL import Image
+    with Image.open(path) as image:
+        width, height = image.size
+        orientation = image.getexif().get(274, 1)
+    return (height, width) if orientation in (5, 6, 7, 8) else (width, height)
+
+
+def evaluate(args):
+    """Compare a manifest with a verified reference manifest of the same photographs."""
+    import numpy as np
+    result, reference = load(args.manifest), load(args.reference)
+    def key(page):
+        return Path(page['source']).name, page['id'].rsplit('-', 1)[-1]
+    expected = {key(p): p for p in reference['pages']}
+    found = {key(p): p for p in result['pages']}
+    sizes, rows = {}, []
+    for k in sorted(set(expected) & set(found)):
+        ref, got = expected[k], found[k]
+        source = ref['source'] if Path(ref['source']).exists() else got['source']
+        if source not in sizes:
+            sizes[source] = np.float64(oriented_size(source))
+        size = sizes[source]
+        a, b = np.float64(ref['quad']) * size, np.float64(got['quad']) * size
+        width = (np.linalg.norm(a[1] - a[0]) + np.linalg.norm(a[2] - a[3])) / 2
+        error = np.linalg.norm(a - b, axis=1) / width * 100
+        side = k[1]
+        gutter = {'L': [1, 2], 'R': [0, 3]}.get(side, [])
+        outer = [i for i in range(4) if i not in gutter]
+        flagged = bool(got.get('flags')) or got.get('detection') in ('contour', 'full-frame-fallback')
+        worst = float(error.max())
+        rows.append(dict(id=got['id'], photo=k[0], side=side, flagged=flagged, flags=got.get('flags', []),
+                         outer=round(float(error[outer].max()), 2),
+                         gutter=round(float(error[gutter].max()), 2) if gutter else None,
+                         worst=round(worst, 2), silent=not flagged and worst > args.tolerance))
+    if not rows:
+        fail('No common pages: match is by photo file name and page side (L, R, P).')
+    outer = np.array([r['outer'] for r in rows])
+    gutter = np.array([r['gutter'] for r in rows if r['gutter'] is not None])
+    silent = [r for r in rows if r['silent']]
+    flagged = [r for r in rows if r['flagged']]
+    summary = dict(pages=len(rows), missing=sorted('-'.join(k) for k in set(expected) - set(found)),
+                   extra=sorted('-'.join(k) for k in set(found) - set(expected)),
+                   outer_median=round(float(np.median(outer)), 2), outer_p90=round(float(np.percentile(outer, 90)), 2),
+                   gutter_median=round(float(np.median(gutter)), 2) if gutter.size else None,
+                   gutter_p90=round(float(np.percentile(gutter, 90)), 2) if gutter.size else None,
+                   flagged=len(flagged), silent=len(silent), tolerance=args.tolerance)
+    print(f"{summary['pages']} pages compared; corner error, % of page width: outer median "
+          f"{summary['outer_median']} / p90 {summary['outer_p90']}"
+          + (f"; gutter median {summary['gutter_median']} / p90 {summary['gutter_p90']}" if gutter.size else ''))
+    print(f"flagged for a check: {len(flagged)} ({100 * len(flagged) / len(rows):.0f} %); "
+          f"silent failures (unflagged, error > {args.tolerance} %): {len(silent)}")
+    for r in sorted(silent, key=lambda r: -r['worst']):
+        print(f"  SILENT {r['id']} ({r['photo']}): worst corner {r['worst']} %")
+    if summary['missing'] or summary['extra']:
+        print(f"page set differs: missing {summary['missing']}, extra {summary['extra']}")
+    if args.json:
+        dump(args.json, dict(summary=summary, pages=rows))
+    if len(silent) > args.max_silent:
+        fail(f'{len(silent)} silent failures exceed --max-silent {args.max_silent}.')
+    print('EVAL OK')
+
+
+def grid_period(profile, low, high):
+    """Dominant period (px) of a ruling profile between `low` and `high` px, with its SNR."""
+    import numpy as np
+    profile = np.asarray(profile, float)
+    profile = profile - np.convolve(profile, np.ones(31) / 31, mode='same')
+    profile = profile[15:-15] * np.hanning(len(profile) - 30)
+    size = 1 << (len(profile) * 8).bit_length()
+    spectrum = np.abs(np.fft.rfft(profile, size))
+    freq = np.fft.rfftfreq(size)
+    band = (freq > 1 / high) & (freq < 1 / low)
+    if not band.any():
+        return None, 0.
+    k = int(np.argmax(spectrum * band))
+    return 1 / freq[k], float(spectrum[k] / max(np.median(spectrum[band]), 1e-9))
+
+
+def page_images(path, work):
+    """Page images from a directory of JPEG/PNG files or from a PDF rendered with pdftoppm."""
+    path = Path(path)
+    if path.is_dir():
+        return sorted(p for p in path.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png'))
+    executable = shutil.which('pdftoppm')
+    if not executable:
+        fail('A PDF input needs Poppler pdftoppm; or pass the build *-pages directory.')
+    render = work / 'measure-render'
+    render.mkdir(exist_ok=True)
+    for old in render.glob('page-*.png'):
+        old.unlink()
+    subprocess.run([executable, '-r', '200', '-png', str(path.resolve()), str(render / 'page')], check=True)
+    return sorted(render.glob('page-*.png'))
+
+
+def measure(args):
+    """Physical page size from square grid cells (or ruled line spacing) on rectified pages."""
+    import numpy as np
+    from PIL import Image
+    work = work_dir(args.work, args.replace)
+    rows = []
+    for number, path in enumerate(page_images(args.input, work), 1):
+        with Image.open(path) as image:
+            red = np.asarray(image.convert('RGB'))[..., 0].astype('float32')
+        h, w = red.shape
+        core = red[int(.1 * h):int(.9 * h), int(.1 * w):int(.9 * w)]
+        low, high = args.min_cell_px, args.max_cell_px
+        px, sx = grid_period(core.mean(0), low, high)
+        py, sy = grid_period(core.mean(1), low, high)
+        row = dict(page=number, file=path.name, pixels=[w, h], cell_x=px and round(px, 2), cell_y=py and round(py, 2),
+                   snr=[round(sx, 1), round(sy, 1)])
+        if py and sy >= args.min_snr:
+            row['height_mm'] = round(h / py * args.cell_mm, 1)
+            if px and sx >= args.min_snr:
+                row['width_mm'] = round(w / px * args.cell_mm, 1)
+                row['aspect'] = round(row['width_mm'] / row['height_mm'], 4)
+                row['cell_ratio'] = round(px / py, 4)
+        rows.append(row)
+    if not rows:
+        fail('No page images found.')
+    usable = [r for r in rows if 'aspect' in r]
+    lines = [r for r in rows if 'height_mm' in r]
+    summary = dict(pages=len(rows), grid_pages=len(usable), ruled_pages=len(lines), cell_mm=args.cell_mm)
+    if usable:
+        for name in ('width_mm', 'height_mm', 'aspect', 'cell_ratio'):
+            values = np.array([r[name] for r in usable])
+            summary[name] = round(float(np.median(values)), 4 if name in ('aspect', 'cell_ratio') else 1)
+            summary[name + '_p10_p90'] = [round(float(v), 4) for v in np.percentile(values, [10, 90])]
+        print(f"{len(usable)}/{len(rows)} pages show a square grid of {args.cell_mm} mm: page "
+              f"{summary['width_mm']} x {summary['height_mm']} mm, aspect {summary['aspect']} "
+              f"(p10-p90 {summary['aspect_p10_p90'][0]}-{summary['aspect_p10_p90'][1]}), "
+              f"cell x/y {summary['cell_ratio']}.")
+        print(f"Suggested: \"aspect\": {summary['aspect']} for these pages and build --width-mm {summary['width_mm']}.")
+    elif lines:
+        summary['height_mm'] = round(float(np.median([r['height_mm'] for r in lines])), 1)
+        print(f"Only horizontal ruling found on {len(lines)} pages: page height about {summary['height_mm']} mm "
+              f"for {args.cell_mm} mm spacing. Width needs a known format or a grid.")
+    else:
+        print('No regular ruling found; set aspect from a known paper format instead.')
+    dump(work / 'measure.json', dict(summary=summary, pages=rows))
+    print(f'Details: {work / "measure.json"}')
+
+
+def compare(args):
+    """Each built page re-warped from its photo with a margin, the crop drawn: what lies outside it."""
+    import cv2
+    import numpy as np
+    from PIL import Image, ImageDraw
+    record = load(args.record)
+    wanted = None
+    if args.pages:
+        wanted = set()
+        for part in args.pages.split(','):
+            a, _, b = part.partition('-')
+            wanted.update(range(int(a), int(b or a) + 1))
+    work = work_dir(args.work, args.replace)
+    done, last, source = 0, None, None
+    for page in record['pages']:
+        if wanted and page['page'] not in wanted:
+            continue
+        if page['source'] != last:
+            source, last = np.array(photo(page['source'])), page['source']
+        if digest(page['source']) != page['sha256']:
+            fail(f"Photograph changed since build: {page['source']}")
+        w, h = page['pixels']
+        mx, my = round(args.margin * w), round(args.margin * h)
+        shift = np.array([[1, 0, mx], [0, 1, my], [0, 0, 1]], float) @ np.array(page['matrix'])
+        view = cv2.warpPerspective(source, shift, (w + 2 * mx, h + 2 * my), flags=cv2.INTER_CUBIC,
+                                   borderValue=(60, 60, 60))
+        image = Image.fromarray(view)
+        draw = ImageDraw.Draw(image)
+        draw.rectangle([mx - 1, my - 1, mx + w, my + h], outline=(255, 0, 40), width=2)
+        image.thumbnail((args.max_edge, args.max_edge))
+        image.save(work / f"compare-{page['page']:04d}.jpg", quality=90)
+        done += 1
+    if not done:
+        fail('No pages selected.')
+    print(f'{done} pages -> {work}; red frame = PDF page border, outside it = what the crop left out.')
+
+
+def edge_metrics(paths):
+    """Per rendered page: dark (non-paper) share of a 0.6 % border strip and ink share of a 0.4 % strip."""
+    import numpy as np
+    from PIL import Image
+    import cv2
+    rows = []
+    for number, path in enumerate(paths, 1):
+        with Image.open(path) as image:
+            rgb = np.asarray(image.convert('RGB'))
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        r, b = rgb[..., 0].astype(int), rgb[..., 2].astype(int)
+        dark = hsv[..., 2] < 120
+        ink = ((b - r > 40) & (hsv[..., 1] > 80) & (hsv[..., 2] < 210)) | ((r - b > 50) & (hsv[..., 1] > 80))
+        h, w = dark.shape
+        row = dict(page=number)
+        for name, wide in (('dark', .006), ('ink', .004)):
+            mask = dark if name == 'dark' else ink
+            sw, sh = max(2, round(wide * w)), max(2, round(wide * h))
+            strips = dict(top=mask[:sh], bottom=mask[-sh:], left=mask[:, :sw], right=mask[:, -sw:])
+            row[name] = {k: round(float(v.mean()) * 100, 2) for k, v in strips.items()}
+        rows.append(row)
+    return rows
 
 
 def inspect(args):
@@ -570,6 +950,28 @@ def main():
     p.add_argument('--plan', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.set_defaults(run=crop)
+    p = subs.add_parser('eval', help='Compare a manifest with a verified reference manifest')
+    p.add_argument('manifest', type=Path)
+    p.add_argument('--reference', type=Path, required=True)
+    p.add_argument('--tolerance', type=float, default=3.0, help='Corner error, %% of page width, that counts as a failure')
+    p.add_argument('--max-silent', type=int, default=0, help='Allowed unflagged failures before exit 1')
+    p.add_argument('--json', type=Path, help='Write per-page results')
+    p.set_defaults(run=evaluate)
+    p = subs.add_parser('measure', help='Page size and aspect from grid cells on built pages')
+    p.add_argument('input', type=Path, help='Build *-pages directory or a PDF')
+    p.add_argument('--work', type=Path, required=True)
+    p.add_argument('--cell-mm', type=float, default=5.0)
+    p.add_argument('--min-cell-px', type=float, default=15.0)
+    p.add_argument('--max-cell-px', type=float, default=120.0)
+    p.add_argument('--min-snr', type=float, default=6.0)
+    p.set_defaults(run=measure)
+    p = subs.add_parser('compare', help='Built pages re-warped from the photos with a margin around the crop')
+    p.add_argument('record', type=Path, help='The .scan.json written by build')
+    p.add_argument('--work', type=Path, required=True)
+    p.add_argument('--pages', help='For example 3,7-9; default all')
+    p.add_argument('--margin', type=float, default=.04, help='Margin as a share of the page size')
+    p.add_argument('--max-edge', type=positive, default=1400)
+    p.set_defaults(run=compare)
     p = subs.add_parser('inspect', help='Corner close-ups of manifest quads for manual correction')
     p.add_argument('manifest', type=Path)
     p.add_argument('--work', type=Path, required=True)
@@ -580,6 +982,8 @@ def main():
     p.add_argument('input', type=Path)
     p.add_argument('--work', type=Path, required=True)
     p.add_argument('--max-edge', type=positive, default=1400)
+    p.add_argument('--dark-limit', type=float, default=10.0, help='%% dark pixels in a border strip worth a look')
+    p.add_argument('--ink-limit', type=float, default=1.0, help='%% ink pixels in a border strip worth a look')
     p.set_defaults(run=review)
     for p in subs.choices.values():
         p.add_argument('--replace', action='store_true', help='Allow replacing task outputs, never source photos')
