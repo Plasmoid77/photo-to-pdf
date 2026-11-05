@@ -152,6 +152,24 @@ the effort. In this test `prepare` took 143 s for 48 photos (33 s for the origin
 version); it now processes photos in parallel and takes 22 s on 8 cores (36 s for
 the 78 photos of the thick notebook), with identical output.
 
+A third run of the same task used the cheap-model screening from `SKILL.md`:
+six Sonnet agents looked at all 91 `compare` images, and the main agent (Opus)
+opened only the 13 flagged pages and the 11 pages the screeners marked (3 real
+defects, fixed). The three final PDFs were then compared side by side in one blind check.
+
+| | current version, no screening | with screening |
+|---|---|---|
+| time | 44 min | 12 min |
+| main-agent tool calls (image views) | 215 (137) | 84 (38) |
+| main agent: cached input / output tokens | 27 M / 123 k | 7.4 M / 45 k |
+| screeners (Sonnet): input / output tokens | — | 0.7 M / 19 k |
+| fold error vs hand labels, median / max | 2 px / 17.5 px | 2 px / 16.8 px |
+| blind check of every page: lost / noticeable / minor | 0 / 0 / 37 | 0 / 0 / 33 |
+
+The original version scored 0 / 0 / 19 in that blind check: its agent placed the
+corners by hand. Most minor defects of the current version are a small wedge of
+desk at the top corner next to the fold. One run per version.
+
 Known limits: a page edge is fitted with a straight line, so a strongly curled
 page keeps a sliver of background at the corners or loses a few pixels of paper.
 Pen strokes between the tight edge and the paper edge move the edge outward
