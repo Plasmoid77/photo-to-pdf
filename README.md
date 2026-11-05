@@ -1,5 +1,9 @@
 # photo-to-pdf
 
+[![tests](https://github.com/Plasmoid77/photo-to-pdf/actions/workflows/tests.yml/badge.svg)](https://github.com/Plasmoid77/photo-to-pdf/actions/workflows/tests.yml)
+![python](https://img.shields.io/badge/python-3.10%2B-blue)
+[![license](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
+
 [Русская версия](README.ru.md)
 
 Turns phone photos of notebooks, books and paper documents into a clean PDF scan.
@@ -12,6 +16,24 @@ The tool finds pages and folds automatically, flags placements that look
 implausible, and renders material for checking every page against its photo. It
 does not claim a fully automatic result: a person or an agent still looks at
 every page before the PDF is final.
+
+## Example
+
+A spread of a lecture notebook on electrical machines, shot with a phone on a
+desk. `prepare` found both pages and the fold by itself (red: left page, green:
+right page) and raised no flags; the background is dimmed only for this picture.
+
+![Phone photo of a notebook spread with the page outlines found by prepare](docs/demo/photo.jpg)
+
+`build` with these outlines, unchanged, gives two flat pages, one perspective
+warp each:
+
+![The two pages produced by build](docs/demo/pages.jpg)
+
+Against the hand-checked outlines of the same photo, the automatic corners are
+off by a median of 0.9 % of the page width at the outer edges and 0.5 % at the
+fold. The page proportions come from `measure` (5 mm grid). The images are
+downscaled for this page.
 
 ## What it does
 
@@ -68,7 +90,7 @@ lists the options.
 
 ## Accuracy
 
-Checked on two real notebooks (photos not included):
+Checked on two real notebooks (photos not included, except the example spread):
 
 | | photos | pages | fold error, median | fold error, worst unflagged | silent failures (> 3 % of page width) |
 |---|---|---|---|---|---|
