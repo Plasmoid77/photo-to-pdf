@@ -238,6 +238,7 @@ def crease(full, quad):
     xs, ys = np.float64(xs), np.float64(ys)
     slope, offset = np.polyfit(ys, xs, 1)
     error = np.abs(xs - (slope * ys + offset))
+    disagree = error.max() > .008 * W
     if error.max() > .004 * W:
         keep = np.argsort(error)[:2]
         slope, offset = np.polyfit(ys[keep], xs[keep], 1)
@@ -246,7 +247,7 @@ def crease(full, quad):
         flags.append('gutter-off-centre')
     if ambiguity > .85:
         flags.append('gutter-ambiguous')
-    if np.sort(np.abs(xs - (slope * ys + offset)))[1] > .004 * W:
+    if disagree:
         flags.append('gutter-bands-disagree')
     gray = cv2.warpPerspective(cv2.cvtColor(full, cv2.COLOR_RGB2GRAY), matrix, (W, H),
                                flags=cv2.INTER_AREA).astype('float32')
@@ -661,6 +662,12 @@ def oriented_size(path):
 def evaluate(args):
     """Compare a manifest with a verified reference manifest of the same photographs."""
     import numpy as np
+    if args.json:
+        target = args.json.resolve()
+        if target in (args.manifest.resolve(), args.reference.resolve()):
+            fail('--json must not be one of the input manifests.')
+        if target.exists() and not args.replace:
+            fail(f'Output exists: {target}; use a fresh path or --replace.')
     result, reference = load(args.manifest), load(args.reference)
     def key(page):
         return Path(page['source']).name, page['id'].rsplit('-', 1)[-1]
@@ -722,6 +729,8 @@ def grid_period(profile, low, high):
     """
     import numpy as np
     profile = np.asarray(profile, float)
+    if len(profile) < 62:
+        return None, 0.
     profile = profile - np.convolve(profile, np.ones(31) / 31, mode='same')
     profile = profile[15:-15] - profile[15:-15].mean()
     if len(profile) < 3 * low or not profile.any():
@@ -768,6 +777,8 @@ def measure(args):
     """Physical page size from square grid cells (or ruled line spacing) on rectified pages."""
     import numpy as np
     from PIL import Image
+    if not (math.isfinite(args.cell_mm) and args.cell_mm > 0) or not 0 < args.min_cell_px < args.max_cell_px:
+        fail('--cell-mm must be positive and --min-cell-px < --max-cell-px.')
     work = work_dir(args.work, args.replace)
     rows = []
     for number, path in enumerate(page_images(args.input, work), 1):
@@ -784,7 +795,7 @@ def measure(args):
             row['height_mm'] = round(h / py * args.cell_mm, 1)
             if px and sx >= args.min_correlation and .9 < px / py < 1.1:
                 row['width_mm'] = round(w / px * args.cell_mm, 1)
-                row['aspect'] = round(row['width_mm'] / row['height_mm'], 4)
+                row['aspect'] = round((w / px) / (h / py), 4)
                 row['cell_ratio'] = round(px / py, 4)
         rows.append(row)
     if not rows:
@@ -823,11 +834,13 @@ def compare(args):
         wanted = set()
         for part in args.pages.split(','):
             a, _, b = part.partition('-')
+            if not a.strip().isdecimal() or (b and not b.strip().isdecimal()) or int(b or a) < int(a):
+                fail(f'Invalid page range: {part}')
             wanted.update(range(int(a), int(b or a) + 1))
     work = work_dir(args.work, args.replace)
     done, last, source = 0, None, None
     for page in record['pages']:
-        if wanted and page['page'] not in wanted:
+        if wanted is not None and page['page'] not in wanted:
             continue
         if page['source'] != last:
             source, last = np.array(photo(page['source'])), page['source']
