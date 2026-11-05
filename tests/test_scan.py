@@ -122,6 +122,25 @@ class Detection(unittest.TestCase):
                 self.assertEqual(page['flags'], [], f'{name} {side} unexpectedly flagged')
                 self.assertLess(corner_error(page['quad'], quad, width), 1.0, f'{name} {side}')
 
+    def test_prepare_jobs_identical(self):
+        image, _, _ = spread_photo(self.rng, shadow=True)
+        self.save('2.jpg', image)
+        shutil.copyfile(self.photos / '2.jpg', self.photos / '10.jpg')
+        manifests = []
+        works = [self.tmp / 'serial', self.tmp / 'parallel']
+        for jobs, work in zip((1, 2), works):
+            run('prepare', self.photos, '--work', work, '--jobs', jobs)
+            manifests.append(json.loads((work / 'manifest.json').read_text()))
+        self.assertEqual(manifests[0], manifests[1])
+        self.assertEqual([p['id'] for p in manifests[0]['pages']],
+                         ['0001-L', '0001-R', '0002-L', '0002-R'])
+        self.assertTrue(all('duplicate' in p['flags'] for p in manifests[0]['pages'][2:]))
+        # Preview labels (including duplicate CHECK), outlines and contact sheets stay identical.
+        for preview in works[0].glob('*.jpg'):
+            self.assertEqual(preview.read_bytes(), (works[1] / preview.name).read_bytes())
+        bad = run('prepare', self.photos, '--work', self.tmp / 'bad', '--jobs', 0, check=False)
+        self.assertNotEqual(bad.returncode, 0)
+
     def test_cover_side_is_flagged(self):
         # unruled cardboard (inside of a cover) next to a page: both are paper-coloured
         image, _, _ = spread_photo(self.rng, cover_right=True)

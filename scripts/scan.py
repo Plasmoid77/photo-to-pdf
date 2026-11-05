@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shutil
@@ -484,6 +485,102 @@ def physical_aspect(page, size):
     return width / max(height, 1)
 
 
+def prepare_photo(task):
+    """Independent full-resolution detection; only a thumbnail crosses the process boundary."""
+    path, layout = task
+    image = photo(path)
+    size = image.size
+    choices, method, info, flags = guess(image, layout)
+    checksum = digest(path)
+    image.thumbnail((1100, 1100))
+    return size, choices, method, info, flags, checksum, image
+
+
+def prepare_worker():
+    import cv2
+    # Each process already occupies a CPU. Avoid multiplying OpenCV's thread pool.
+    cv2.setNumThreads(1)
+
+
+def available_memory():
+    """Available bytes, including a Linux cgroup limit when present; None if unknown."""
+    values = []
+    try:
+        for line in Path('/proc/meminfo').read_text().splitlines():
+            if line.startswith('MemAvailable:'):
+                values.append(int(line.split()[1]) * 1024)
+    except (OSError, ValueError):
+        pass
+    # Resolve the process's cgroup, including ancestors with a tighter limit.
+    try:
+        for line in Path('/proc/self/cgroup').read_text().splitlines():
+            _, controllers, group = line.split(':', 2)
+            if not controllers:
+                base, limit, usage = Path('/sys/fs/cgroup'), 'memory.max', 'memory.current'
+            elif 'memory' in controllers.split(','):
+                base = Path('/sys/fs/cgroup/memory')
+                limit, usage = 'memory.limit_in_bytes', 'memory.usage_in_bytes'
+            else:
+                continue
+            directory = base / group.lstrip('/')
+            while directory.is_relative_to(base):
+                try:
+                    values.append(max(0, int((directory / limit).read_text())
+                                      - int((directory / usage).read_text())))
+                except (OSError, ValueError):
+                    pass
+                if directory == base:
+                    break
+                directory = directory.parent
+    except (OSError, ValueError):
+        pass
+    return min(values) if values else None
+
+
+def prepare_jobs(sources, requested):
+    if requested is not None:
+        return min(requested, len(sources))
+    from PIL import Image
+    cores = os.cpu_count() or 1
+    try:
+        cores = min(cores, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        pass
+    memory = available_memory()
+    if memory is None:
+        return 1
+    pixels = 0
+    for path in sources:
+        with Image.open(path) as image:
+            pixels = max(pixels, image.width * image.height)
+    # Allow full RGB/EXIF copies and detector arrays, plus interpreter/allocator overhead.
+    # Keep room for the parent, queued thumbnails and other applications.
+    worker_bytes = max(512 * 1024 ** 2, pixels * 48 + 128 * 1024 ** 2)
+    return max(1, min(len(sources), cores, (memory - 384 * 1024 ** 2) // worker_bytes))
+
+
+def prepared_photos(sources, layout, jobs):
+    tasks = ((path, layout) for path in sources)
+    if jobs == 1:
+        for task in tasks:
+            yield prepare_photo(task)
+        return
+    from collections import deque
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing
+    # Spawn avoids inheriting initialized OpenCV/BLAS thread pools, also on Python 3.10.
+    with ProcessPoolExecutor(max_workers=jobs, initializer=prepare_worker,
+                             mp_context=multiprocessing.get_context('spawn')) as pool:
+        pending = deque()
+        for _ in range(jobs):
+            pending.append(pool.submit(prepare_photo, next(tasks)))
+        while pending:
+            yield pending.popleft().result()
+            task = next(tasks, None)
+            if task is not None:
+                pending.append(pool.submit(prepare_photo, task))
+
+
 def prepare(args):
     import numpy as np
     from PIL import ImageDraw
@@ -500,12 +597,11 @@ def prepare(args):
     if not sources:
         fail(f'No supported photographs: {root}')
     pages, previews, seen, sizes = [], [], {}, {}
-    for number, path in enumerate(sources, 1):
-        image = photo(path)
-        sizes[str(path.resolve())] = image.size
-        choices, method, info, flags = guess(image, args.layout)
-        checksum = digest(path)
-        image.thumbnail((1100, 1100))
+    jobs = prepare_jobs(sources, getattr(args, 'jobs', None))
+    results = prepared_photos(sources, args.layout, jobs)
+    for number, (result, path) in enumerate(zip(results, sources), 1):
+        size, choices, method, info, flags, checksum, image = result
+        sizes[str(path.resolve())] = size
         draw = ImageDraw.Draw(image)
         for side, points, extra in choices:
             item = dict(id=f'{number:04d}-{side}', source=str(path.resolve()), sha256=checksum,
@@ -523,6 +619,7 @@ def prepare(args):
         preview = work / f'source-{number:03d}.jpg'
         image.save(preview, quality=92)
         previews.append(preview)
+        image.close()
     for page in pages:
         q = np.float64(page['quad'])
         if ((q < .003).any() or (q > .997).any()) and 'touches-frame' not in page['flags']:
@@ -1046,6 +1143,7 @@ def main():
     p.add_argument('input', type=Path)
     p.add_argument('--work', type=Path, required=True)
     p.add_argument('--layout', choices=['auto', 'pages', 'spreads'], default='auto')
+    p.add_argument('--jobs', type=positive, help='Worker processes (default: CPU/memory limited; 1: serial)')
     p.set_defaults(run=prepare)
     p = subs.add_parser('build', help='Create PDF from visually reviewed quads')
     p.add_argument('manifest', type=Path)
