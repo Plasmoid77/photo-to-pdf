@@ -55,6 +55,19 @@ downscaled for this page.
   cells. Renders every page, reports background or writing at page borders, and
   shows each page with a margin of the photo around its crop.
 
+## Taking the photos
+
+- **Dark background.** Put the paper on a dark, matte surface. Pages are found as
+  bright, low-saturation paper against a darker background; a white table, a sheet
+  of paper or a lit screen next to the page merges with it.
+- **Whole sheet in the frame**, with a small margin. A page that touches the edge of
+  the photo is flagged, and whatever is outside the photo is lost.
+- **From above, in even light**: no flash glare or hard shadows across the page.
+- **One sheet or one spread per photo.** For loose sheets, including landscape A4,
+  run `prepare --layout pages`; in `auto` any outline more than 1.25 times wider
+  than tall is treated as a spread and split in two.
+- **Fingers off the writing and the edges**: hold a notebook by the cover.
+
 ## Install
 
 ```bash
