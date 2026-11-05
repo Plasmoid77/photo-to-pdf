@@ -61,16 +61,22 @@ def contact(paths, destination, prefix):
     from PIL import Image, ImageDraw, ImageOps
     for path in destination.glob(f'{prefix}-[0-9][0-9][0-9].jpg'):
         path.unlink()
-    for start in range(0, len(paths), 6):
-        sheet = Image.new('RGB', (1560, 1360), '#ddd')
+    wide = 0
+    for path in paths:
+        with Image.open(path) as image:
+            wide += image.width > image.height
+    cols, rows, (cw, ch) = (4, 5, (480, 300)) if wide * 2 > len(paths) else (3, 2, (510, 630))
+    per = cols * rows
+    for start in range(0, len(paths), per):
+        sheet = Image.new('RGB', (cols * (cw + 10), rows * (ch + 50)), '#ddd')
         draw = ImageDraw.Draw(sheet)
-        for offset, path in enumerate(paths[start:start + 6]):
+        for offset, path in enumerate(paths[start:start + per]):
+            x, y = offset % cols * (cw + 10), offset // cols * (ch + 50)
             with Image.open(path) as image:
-                thumb = ImageOps.contain(image, (510, 630))
-                x, y = offset % 3 * 520, offset // 3 * 680
-                sheet.paste(thumb, (x + (520 - thumb.width) // 2, y))
-            draw.text((x + 8, y + 642), str(start + offset + 1), fill='black')
-        sheet.save(destination / f'{prefix}-{start // 6 + 1:03d}.jpg', quality=92)
+                thumb = ImageOps.contain(image, (cw, ch))
+                sheet.paste(thumb, (x + (cw + 10 - thumb.width) // 2, y))
+            draw.text((x + 8, y + ch + 12), str(start + offset + 1), fill='black')
+        sheet.save(destination / f'{prefix}-{start // per + 1:03d}.jpg', quality=92)
 
 
 def ordered(points):
@@ -82,24 +88,187 @@ def ordered(points):
     return np.roll(points, -np.argmin(points.sum(axis=1)), axis=0)
 
 
-def guess(image):
+def paper_mask(small, saturation):
+    """Largest bright low-saturation region with holes filled, or None."""
+    import cv2
+    import numpy as np
+    hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
+    mask = ((hsv[:, :, 1] < saturation) & (hsv[:, :, 2] > 110)).astype('uint8') * 255
+    side = max(small.shape[:2])
+    for operation, size in [(cv2.MORPH_CLOSE, side // 128 | 1), (cv2.MORPH_OPEN, side // 62 | 1)]:
+        mask = cv2.morphologyEx(mask, operation, np.ones((size, size), 'uint8'))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+    if count < 2:
+        return None
+    best = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    if stats[best, cv2.CC_STAT_AREA] < .08 * mask.size:
+        return None
+    contours, _ = cv2.findContours((labels == best).astype('uint8'), cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_NONE)
+    mask = np.zeros_like(mask)
+    cv2.drawContours(mask, contours, -1, 255, -1)
+    return mask
+
+
+def outline(mask):
+    import cv2
+    import numpy as np
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    hull = cv2.convexHull(max(contours, key=cv2.contourArea))
+    perimeter = cv2.arcLength(hull, True)
+    for epsilon in np.linspace(.005, .1, 80):
+        quad = cv2.approxPolyDP(hull, epsilon * perimeter, True)
+        if len(quad) == 4:
+            return ordered(quad[:, 0])
+    return ordered(cv2.boxPoints(cv2.minAreaRect(hull)))
+
+
+def fit(t, v, inward, percentile=90):
+    """Robust line v = a*t + b, moved inward until `percentile`% of edge samples lie outside it."""
+    import numpy as np
+    t, v = np.asarray(t, float), np.asarray(v, float)
+    keep = np.ones(len(t), bool)
+    for _ in range(5):
+        if keep.sum() < 20:
+            return None
+        a, b = np.polyfit(t[keep], v[keep], 1)
+        residual = v - (a * t + b)
+        spread = 1.4826 * np.median(np.abs(residual[keep] - np.median(residual[keep]))) + .5
+        keep = np.abs(residual) < 3 * spread
+    if keep.sum() < 20:
+        return None
+    return a, b + inward * np.percentile(inward * residual[keep], percentile)
+
+
+def meet(horizontal, vertical):
+    """Intersection of y = a*x + b with x = c*y + d."""
+    (a, b), (c, d) = horizontal, vertical
+    y = (a * d + b) / (1 - a * c)
+    return [c * y + d, y]
+
+
+def refine(small, full, mask, quad, spread):
+    """Per-page quads from edge lines in the rectified draft frame.
+
+    Top and outer edges: tight (90% of the paper edge lies outside the line); bottom: median line,
+    because writing often reaches the lower edge. Gutter: the shadow valley is usually on one page,
+    so the fold is the steepest brightness step next to it, measured on the full-resolution photo.
+    """
+    import cv2
+    import numpy as np
+    width = (np.linalg.norm(quad[1] - quad[0]) + np.linalg.norm(quad[2] - quad[3])) / 2
+    height = (np.linalg.norm(quad[3] - quad[0]) + np.linalg.norm(quad[2] - quad[1])) / 2
+    W = 2400 if spread else 1600
+    H = max(200, round(W * height / max(width, 1)))
+    mx, my = round(.06 * W), round(.06 * H)
+    frame = np.float32([[mx, my], [mx + W, my], [mx + W, my + H], [mx, my + H]])
+    matrix = cv2.getPerspectiveTransform(np.float32(quad), frame)
+    size = (W + 2 * mx, H + 2 * my)
+    sheet = cv2.warpPerspective(mask, matrix, size, flags=cv2.INTER_NEAREST) > 127
+    def edge(name, start, stop):
+        steps = np.arange(round(start), round(stop), 4)
+        if name == 'top':
+            band = sheet[:my + round(.12 * H), steps]
+            found = band.argmax(0)
+        elif name == 'bottom':
+            low = my + H - round(.12 * H)
+            band = sheet[low:, steps]
+            found = low + band.shape[0] - 1 - band[::-1].argmax(0)
+        elif name == 'left':
+            band = sheet[steps, :mx + round(.1 * W)].T
+            found = band.argmax(0)
+        else:
+            low = mx + W - round(.1 * W)
+            band = sheet[steps, low:].T
+            found = low + band.shape[0] - 1 - band[::-1].argmax(0)
+        hit = band.any(0)
+        return steps[hit], found[hit]
+    left = fit(*edge('left', my + .08 * H, my + .92 * H), 1)
+    right = fit(*edge('right', my + .08 * H, my + .92 * H), -1)
+    info = {}
+    if spread:
+        scale = small.shape[1] / full.shape[1]
+        gray = cv2.cvtColor(cv2.warpPerspective(full, matrix @ np.diag([scale, scale, 1]), size),
+                            cv2.COLOR_RGB2GRAY).astype('float32')
+        def column(a, b, sigma):
+            row = np.median(gray[my + round(a * H):my + round(b * H)], axis=0)
+            return cv2.GaussianBlur(row.reshape(1, -1), (0, 0), sigma).ravel()
+        def valley(row, low, high, reach=30):
+            depth = row[low:high] - (row[low - reach:high - reach] + row[low + reach:high + reach]) / 2
+            return low + int(np.argmin(depth)), float(depth.min())
+        centre, depth = valley(column(.1, .9, 3), mx + round(.4 * W), mx + round(.6 * W))
+        info['gutter_contrast'] = round(-depth, 1)
+        reach, ys, xs = round(.025 * W), [], []
+        for a, b in [(.03, .25), (.4, .6), (.75, .97)]:
+            shadow = valley(column(a, b, 3), centre - reach, centre + reach)[0]
+            step = np.abs(np.gradient(column(a, b, 2))[shadow - 45:shadow + 45])
+            xs.append(shadow - 45 + int(np.argmax(step)))
+            ys.append(my + (a + b) / 2 * H)
+        ys, xs = np.float64(ys), np.float64(xs)
+        slope, offset = np.polyfit(ys, xs, 1)
+        error = np.abs(xs - (slope * ys + offset))
+        if error.max() > 12:
+            best = np.argsort(error)[:2]
+            slope, offset = np.polyfit(ys[best], xs[best], 1)
+        overlap = .0015 * W
+        spans = [('L', mx + .04 * W, min(xs) - .07 * W, left, (slope, offset + overlap)),
+                 ('R', max(xs) + .07 * W, mx + .96 * W, (slope, offset - overlap), right)]
+    else:
+        spans = [('P', mx + .06 * W, mx + .94 * W, left, right)]
+    inverse = np.linalg.inv(matrix)
+    pages = []
+    for side, start, stop, outer_left, outer_right in spans:
+        top = fit(*edge('top', start, stop), 1)
+        bottom = fit(*edge('bottom', start, stop), -1, 50)
+        if None in (top, bottom, outer_left, outer_right):
+            return None, info
+        corners = [meet(top, outer_left), meet(top, outer_right),
+                   meet(bottom, outer_right), meet(bottom, outer_left)]
+        points = cv2.perspectiveTransform(np.float32(corners).reshape(-1, 1, 2), inverse)[:, 0]
+        if not cv2.isContourConvex(points) or cv2.contourArea(points) < .25 * cv2.contourArea(np.float32(quad)):
+            return None, info
+        pages.append((side, points))
+    return pages, info
+
+
+def guess(image, layout):
+    """Draft per-page quads (normalized) for one photo: [(side, quad)], method, extra fields."""
     import cv2
     import numpy as np
     w, h = image.size
-    scale = min(1.0, 1200 / max(w, h))
-    small = cv2.resize(np.array(image), None, fx=scale, fy=scale)
-    hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
-    mask = ((hsv[:, :, 2] > 110) & (hsv[:, :, 1] < 145)).astype('uint8') * 255
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((11, 11), 'uint8'))
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        contour = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(contour) > small.shape[0] * small.shape[1] * .08:
-            for epsilon in [.01, .02, .04]:
-                quad = cv2.approxPolyDP(contour, epsilon * cv2.arcLength(contour, True), True)
-                if len(quad) == 4 and cv2.isContourConvex(quad):
-                    return ordered(quad[:, 0] / scale) / [w, h], 'contour'
-    return np.float32([[0, 0], [1, 0], [1, 1], [0, 1]]), 'full-frame-fallback'
+    full = np.array(image)
+    scale = min(1.0, 1600 / max(w, h))
+    small = cv2.resize(full, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
+    norm = np.float32([small.shape[1], small.shape[0]])
+    for saturation in [60, 145]:
+        mask = paper_mask(small, saturation)
+        if mask is not None:
+            break
+    if mask is None:
+        quad = np.float32([[0, 0], [1, 0], [1, 1], [0, 1]]) * norm
+        method = 'full-frame-fallback'
+    else:
+        quad, method = outline(mask), 'contour'
+    ratio = np.linalg.norm(quad[1] - quad[0]) / max(np.linalg.norm(quad[3] - quad[0]), 1)
+    spread = layout == 'spreads' or (layout == 'auto' and ratio > 1.25)
+    extra = {}
+    if mask is not None:
+        try:
+            pages, extra = refine(small, full, mask, quad, spread)
+        except (ValueError, IndexError, ZeroDivisionError, np.linalg.LinAlgError, cv2.error):
+            pages = None
+        if pages:
+            method = 'edges+gutter' if spread else 'edges'
+            if spread and extra.get('gutter_contrast', 0) < 10:
+                method += '-uncertain'
+            return [(s, q / norm) for s, q in pages], method, extra
+    if spread:
+        tl, tr, br, bl = quad
+        top, bottom = (tl + tr) / 2, (bl + br) / 2
+        pages = [('L', np.array([tl, top, bottom, bl])), ('R', np.array([top, tr, br, bottom]))]
+    else:
+        pages = [('P', quad)]
+    return [(s, q / norm) for s, q in pages], method, extra
 
 
 def prepare(args):
@@ -120,29 +289,21 @@ def prepare(args):
     pages, previews, seen = [], [], {}
     for number, path in enumerate(sources, 1):
         image = photo(path)
-        quad, method = guess(image)
-        pix = quad * image.size
-        ratio = np.linalg.norm(pix[1] - pix[0]) / max(np.linalg.norm(pix[3] - pix[0]), 1)
-        layout = args.layout if args.layout != 'auto' else ('spreads' if ratio > 1.25 else 'pages')
-        choices = [('P', quad)]
-        if layout == 'spreads':
-            tl, tr, br, bl = quad
-            top, bottom = (tl + tr) / 2, (bl + br) / 2
-            choices = [('L', np.array([tl, top, bottom, bl])),
-                       ('R', np.array([top, tr, br, bottom]))]
+        choices, method, extra = guess(image, args.layout)
         checksum = digest(path)
         image.thumbnail((1100, 1100))
         draw = ImageDraw.Draw(image)
         for side, points in choices:
             item = dict(id=f'{number:04d}-{side}', source=str(path.resolve()), sha256=checksum,
-                        quad=points.tolist(), aspect=None, bleed_px=0, enhance=True,
-                        include=True, reviewed=False, detection=method)
+                        quad=np.round(points, 5).tolist(), aspect=None, bleed_px=0, enhance=True,
+                        include=True, reviewed=False, detection=method, **extra)
             if checksum in seen:
                 item['duplicate_of'] = seen[checksum]
             pages.append(item)
             outline = [tuple(p * image.size) for p in points]
-            draw.line(outline + outline[:1], fill=(255, 40, 20), width=3)
-            draw.text(outline[0], item['id'], fill=(255, 30, 20))
+            colour = {'L': (255, 40, 20), 'R': (0, 170, 0)}.get(side, (230, 0, 230))
+            draw.line(outline + outline[:1], fill=colour, width=3)
+            draw.text(outline[0], item['id'], fill=colour)
         seen[checksum] = str(path.resolve())
         preview = work / f'source-{number:03d}.jpg'
         image.save(preview, quality=92)
@@ -175,6 +336,8 @@ def build(args):
     data = load(args.manifest)
     if data.get('version') != 1:
         fail('Unsupported manifest version.')
+    if args.width_mm is not None and not 10 <= args.width_mm <= 2000:
+        fail('--width-mm must be 10..2000.')
     pages = [p for p in data['pages'] if p.get('include', True)]
     if not pages or any(p.get('reviewed') is not True for p in pages):
         fail('Visually review every included page, then set reviewed=true.')
@@ -195,6 +358,10 @@ def build(args):
             fail(f'Invalid aspect: {page["id"]}')
         if isinstance(bleed, bool) or not isinstance(bleed, int) or not 0 <= bleed <= 100:
             fail(f'bleed_px must be an integer 0..100: {page["id"]}')
+        width_mm = page.get('width_mm')
+        if width_mm is not None and (isinstance(width_mm, bool) or not isinstance(width_mm, (int, float))
+                                     or not 10 <= width_mm <= 2000):
+            fail(f'width_mm must be a number 10..2000: {page["id"]}')
     output = target_file(args.output, args.replace)
     images = work_dir(output.parent / f'{output.stem}-pages', args.replace)
     temporary = output.with_name(output.name + '.partial')
@@ -223,14 +390,19 @@ def build(args):
         if page.get('enhance', True):
             result = light(result)
         target = images / f'{number:04d}.jpg'
-        Image.fromarray(result).save(target, quality=95, subsampling=0)
-        size = (result.shape[1] * 72 / args.dpi, result.shape[0] * 72 / args.dpi)
+        Image.fromarray(result).save(target, quality=args.quality, subsampling=0)
+        width_mm = args.width_mm if page.get('width_mm') is None else page['width_mm']
+        if width_mm:
+            size = (width_mm * 72 / 25.4, width_mm * 72 / 25.4 * result.shape[0] / result.shape[1])
+        else:
+            size = (result.shape[1] * 72 / args.dpi, result.shape[0] * 72 / args.dpi)
         pdf.setPageSize(size)
         pdf.drawImage(str(target), 0, 0, *size)
         pdf.showPage()
         record.append(dict(page=number, id=page['id'], source=page['source'],
                            sha256=checksums[str(Path(page['source']).resolve())],
-                           matrix=matrix.tolist(), pixels=[result.shape[1], result.shape[0]]))
+                           matrix=matrix.tolist(), pixels=[result.shape[1], result.shape[0]],
+                           points=[round(size[0], 2), round(size[1], 2)]))
     pdf.save()
     temporary.replace(output)
     dump(output.with_suffix('.scan.json'), dict(version=1, pages=record))
@@ -302,10 +474,78 @@ def review(args):
     print(f'{len(paths)} pages rendered; inspect ALL sheets and individual edge exceptions: {work}')
 
 
+def inspect(args):
+    """Per photo: overview with page outlines + 1:1 crops around every corner, ticks in normalized units."""
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+    data = load(args.manifest)
+    wanted = set(args.ids.split(',')) if args.ids else None
+    groups = {}
+    for page in data['pages']:
+        if (wanted is None and page.get('include', True)) or (wanted and page['id'] in wanted):
+            groups.setdefault(page['source'], []).append(page)
+    if not groups:
+        fail('No matching pages.')
+    work = work_dir(args.work, args.replace)
+    try:
+        font = ImageFont.load_default(size=18)
+    except TypeError:
+        font = ImageFont.load_default()
+    colours = [(255, 0, 0), (0, 190, 0), (230, 0, 230), (0, 120, 255)]
+    half, side = args.half, 2 * args.half
+    for source, pages in groups.items():
+        image = photo(source)
+        w, h = image.size
+        draw = ImageDraw.Draw(image)
+        corners = []
+        for k, page in enumerate(pages):
+            quad = np.float64(page['quad']) * [w, h]
+            draw.line([tuple(p) for p in quad] + [tuple(quad[0])], fill=colours[k % 4], width=2)
+            for point in quad:
+                if all(np.linalg.norm(point - c) > half / 2 for c in corners):
+                    corners.append(point)
+        tiles = []
+        for c in corners:
+            x0, y0 = round(c[0]) - half, round(c[1]) - half
+            tile = Image.new('RGB', (side, side), (60, 60, 60))
+            tile.paste(image.crop((x0, y0, x0 + side, y0 + side)))
+            mark = ImageDraw.Draw(tile)
+            for g in range((x0 // 50 + 1) * 50, x0 + side, 50):
+                mark.line([(g - x0, 0), (g - x0, 16 if g % 100 == 0 else 8)], fill=(255, 255, 0))
+                if g % 100 == 0:
+                    mark.text((g - x0 + 2, 16), f'{g / w:.3f}', fill=(255, 255, 0), font=font)
+            for g in range((y0 // 50 + 1) * 50, y0 + side, 50):
+                mark.line([(0, g - y0), (16 if g % 100 == 0 else 8, g - y0)], fill=(255, 255, 0))
+                if g % 100 == 0:
+                    mark.text((18, g - y0 - 9), f'{g / h:.3f}', fill=(255, 255, 0), font=font)
+            mark.text((4, side - 22), f'({c[0] / w:.4f}, {c[1] / h:.4f})', fill=(0, 255, 255), font=font)
+            tiles.append(tile)
+        columns = 3
+        overview = image.copy()
+        overview.thumbnail((side * columns, side * columns))
+        sheet = Image.new('RGB', (side * columns, overview.height + -(-len(tiles) // columns) * side), (30, 30, 30))
+        sheet.paste(overview, ((sheet.width - overview.width) // 2, 0))
+        legend = ImageDraw.Draw(sheet)
+        for k, page in enumerate(pages):
+            legend.text((8, 8 + 22 * k), page['id'], fill=colours[k % 4], font=font)
+        for i, tile in enumerate(tiles):
+            sheet.paste(tile, (i % columns * side, overview.height + i // columns * side))
+        name = '_'.join(re.sub(r'[^\w.-]', '-', page['id']) for page in pages)
+        sheet.save(work / f'inspect-{name}.jpg', quality=90)
+    print(f'{len(groups)} photographs -> {work}; ticks are normalized quad units (x/width, y/height).')
+
+
 def positive(value):
     value = int(value)
     if value <= 0:
         raise argparse.ArgumentTypeError('Must be positive.')
+    return value
+
+
+def quality(value):
+    value = int(value)
+    if not 60 <= value <= 100:
+        raise argparse.ArgumentTypeError('JPEG quality must be 60..100.')
     return value
 
 
@@ -322,12 +562,20 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--max-edge', type=positive, default=2800)
     p.add_argument('--dpi', type=positive, default=240)
+    p.add_argument('--quality', type=quality, default=95, help='JPEG quality 60..100, 4:4:4')
+    p.add_argument('--width-mm', type=float, help='Physical page width for pages without width_mm')
     p.set_defaults(run=build)
     p = subs.add_parser('crop', help='Crop PDF boxes without recompressing embedded images')
     p.add_argument('input', type=Path)
     p.add_argument('--plan', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.set_defaults(run=crop)
+    p = subs.add_parser('inspect', help='Corner close-ups of manifest quads for manual correction')
+    p.add_argument('manifest', type=Path)
+    p.add_argument('--work', type=Path, required=True)
+    p.add_argument('--ids', help='Comma-separated page ids; default: all included pages')
+    p.add_argument('--half', type=positive, default=200, help='Half crop size in source pixels')
+    p.set_defaults(run=inspect)
     p = subs.add_parser('review', help='Render every PDF page for visual verification')
     p.add_argument('input', type=Path)
     p.add_argument('--work', type=Path, required=True)
