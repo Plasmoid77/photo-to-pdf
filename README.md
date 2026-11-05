@@ -63,9 +63,9 @@ downscaled for this page.
 - **Whole sheet in the frame**, with a small margin. A page that touches the edge of
   the photo is flagged, and whatever is outside the photo is lost.
 - **From above, in even light**: no flash glare or hard shadows across the page.
-- **One sheet or one spread per photo.** For loose sheets, including landscape A4,
-  run `prepare --layout pages`; in `auto` any outline more than 1.25 times wider
-  than tall is treated as a spread and split in two.
+- **One sheet or one spread per photo.** `auto` splits a wide outline only when it
+  sees a fold (gutter shading or a crease line), so a landscape A4 sheet stays one
+  page; for a batch of loose sheets `prepare --layout pages` is still the safest.
 - **Fingers off the writing and the edges**: hold a notebook by the cover.
 
 ## Install
@@ -148,8 +148,9 @@ With the original version the agent got the same final quality by writing its
 own fold and edge detection, then correcting 33 of 91 pages by hand; with the
 current version it corrected 9 pages of the `prepare` draft. Reviewer judgements at the crop line are uncertain
 by a few defects, so the two final PDFs are equal in quality; the difference is
-the effort. `prepare` itself is slower: 143 s instead of 33 s for 48 photos on
-the test machine.
+the effort. In this test `prepare` took 143 s for 48 photos (33 s for the original
+version); it now processes photos in parallel and takes 22 s on 8 cores (36 s for
+the 78 photos of the thick notebook), with identical output.
 
 Known limits: a page edge is fitted with a straight line, so a strongly curled
 page keeps a sliver of background at the corners or loses a few pixels of paper.

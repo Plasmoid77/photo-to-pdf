@@ -416,6 +416,43 @@ def refine(small, full, mask, quad, spread, margin=.06):
     return pages, info, flags
 
 
+def fold_evidence(small, quad):
+    """Fold contrast in blue-channel levels: broad shading or a persistent thin crease.
+
+    Work in a fixed frame so thresholds do not depend on camera resolution. Closing removes
+    thin printing from the shading profile. The thin-line branch excludes coloured ink and
+    requires contrast through almost the entire sheet height (tables usually end inside it).
+    This is photographic evidence, not a guarantee that a printed line cannot resemble a fold.
+    """
+    import cv2
+    import numpy as np
+    W, H = 800, 600
+    matrix = cv2.getPerspectiveTransform(np.float32(quad),
+                np.float32([[0, 0], [W, 0], [W, H], [0, H]]))
+    sheet = cv2.warpPerspective(small, matrix, (W, H))
+    blue = sheet[:, :, 2]
+    smooth = cv2.morphologyEx(blue, cv2.MORPH_CLOSE, np.ones((1, 15), 'uint8'))
+    profile = np.median(smooth[60:540], axis=0).astype('float32')
+    profile = cv2.GaussianBlur(profile.reshape(1, -1), (0, 0), 3).ravel()
+    x = np.arange(320, 480)
+    broad = max(float(np.max(np.abs((profile[x-r] + profile[x+r]) / 2 - profile[x])))
+                for r in (16, 32, 64))
+    plain = blue.astype('float32')
+    background = cv2.morphologyEx(blue, cv2.MORPH_CLOSE, np.ones((1, 15), 'uint8'))
+    ink = ((cv2.cvtColor(sheet, cv2.COLOR_RGB2HSV)[:, :, 1] > 70)
+           | (plain > sheet[:, :, 0].astype('float32') + 3))
+    ink = cv2.dilate(ink.astype('uint8'), np.ones((3, 3), 'uint8')) > 0
+    contrast = np.maximum(background.astype('float32') - plain, 0)
+    contrast[ink] = 0
+    response = cv2.GaussianBlur(contrast, (0, 0), 1.2)
+    rows = np.arange(24, 576, 4)
+    thin = 0.
+    for tilt in range(-40, 41, 2):
+        columns = x[None, :] + np.round(tilt * (rows[:, None] / H - .5)).astype(int)
+        thin = max(thin, float(np.percentile(response[rows[:, None], columns], 10, axis=0).max()))
+    return max(broad, thin)
+
+
 def guess(image, layout):
     """Draft per-page quads (normalized) for one photo: [(side, quad)], method, info, flags."""
     import cv2
@@ -436,6 +473,8 @@ def guess(image, layout):
         quad, method = outline(mask), 'contour'
     ratio = np.linalg.norm(quad[1] - quad[0]) / max(np.linalg.norm(quad[3] - quad[0]), 1)
     spread = layout == 'spreads' or (layout == 'auto' and ratio > 1.25)
+    if layout == 'auto' and spread:
+        spread = mask is not None and fold_evidence(small, quad) >= 2.0
     info, flags = {}, []
     if mask is not None:
         try:

@@ -83,6 +83,31 @@ def spread_photo(rng, shadow=False, crease=True, cover_right=False, background=(
     return photo, left, right
 
 
+def landscape_photo(kind):
+    """Loose landscape sheet with printing that must not count as a fold."""
+    sheet = np.full((1650, 2334, 3), (236, 233, 224), np.uint8)
+    if kind == 'text':
+        for y in range(180, 1500, 80):
+            cv2.putText(sheet, 'Printed text on a single landscape sheet', (140, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.8, (40, 40, 40), 3)
+    elif kind == 'table':
+        for y in range(180, 1501, 110):
+            cv2.line(sheet, (180, y), (2154, y), (40, 40, 40), 3)
+        for x in (180, 1167, 2154):
+            cv2.line(sheet, (x, 180), (x, 1500), (40, 40, 40), 3)
+    elif kind == 'grid':
+        for y in range(20, 1650, 40):
+            cv2.line(sheet, (0, y), (2333, y), (170, 185, 200), 2)
+        for x in range(20, 2334, 40):
+            cv2.line(sheet, (x, 0), (x, 1649), (170, 185, 200), 2)
+        cv2.line(sheet, (1167, 0), (1167, 1649), (200, 70, 70), 3)
+    photo = np.full((2200, 3200, 3), (35, 30, 28), np.uint8)
+    matrix = cv2.getPerspectiveTransform(np.float32([[0, 0], [2334, 0], [2334, 1650], [0, 1650]]),
+                  np.float32([[420, 260], [2900, 300], [2960, 1960], [360, 1900]]))
+    cv2.warpPerspective(sheet, matrix, (3200, 2200), photo, borderMode=cv2.BORDER_TRANSPARENT)
+    return photo
+
+
 def corner_error(a, b, width_px):
     """Largest corner distance as % of the page width."""
     return float(np.linalg.norm((np.float64(a) - np.float64(b)) * [3200, 2200], axis=1).max() / width_px * 100)
@@ -121,6 +146,21 @@ class Detection(unittest.TestCase):
                 self.assertEqual(page['detection'], 'edges+gutter')
                 self.assertEqual(page['flags'], [], f'{name} {side} unexpectedly flagged')
                 self.assertLess(corner_error(page['quad'], quad, width), 1.0, f'{name} {side}')
+
+    def test_landscape_printing_stays_single(self):
+        for kind in ('text', 'table', 'grid'):
+            self.save(kind + '.jpg', landscape_photo(kind))
+        pages = self.prepare()['pages']
+        self.assertEqual(len(pages), 3)
+        self.assertTrue(all(p['id'].endswith('-P') for p in pages))
+
+    def test_explicit_layout_overrides_fold_evidence(self):
+        self.save('table.jpg', landscape_photo('table'))
+        for layout, expected in (('pages', ['P']), ('spreads', ['L', 'R'])):
+            work = self.tmp / layout
+            run('prepare', self.photos, '--work', work, '--layout', layout)
+            pages = json.loads((work / 'manifest.json').read_text())['pages']
+            self.assertEqual([p['id'].split('-')[-1] for p in pages], expected)
 
     def test_prepare_jobs_identical(self):
         image, _, _ = spread_photo(self.rng, shadow=True)
