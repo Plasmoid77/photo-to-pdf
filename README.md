@@ -176,6 +176,18 @@ The original version scored 0 / 0 / 19 in that blind check: its agent placed the
 corners by hand. Most minor defects of the current version are a small wedge of
 desk at the top corner next to the fold. One run per version.
 
+The same screening scheme was then run once on the thick notebook (78 photos),
+which the screening brief was not tuned on, with the version that also follows
+the paper down at the fold. The agent produced 153 pages in 10.6 min with 66
+tool calls (32 image views); the main agent read 5.0 M cached input tokens and
+wrote 33 k, the ten Sonnet screeners took 1.2 M input and 30 k output tokens. It
+fixed the cover (one page, not a spread), corners on five photos and a skewed
+fold. Against the hand-checked reference the corners are off by a median of
+0.9 % (outer) and 0.8 % (fold); six pages differ by more than 3 %, none of them
+loses writing: five are the background wedge left in the reference at the top
+of the fold, one is a blank strip of paper cut off at the bottom. No blind
+check was run for this notebook.
+
 Known limits: a page edge is fitted with a straight line, so a strongly curled
 page keeps a sliver of background at the corners or loses a few pixels of paper.
 Pen strokes between the tight edge and the paper edge move the edge outward
