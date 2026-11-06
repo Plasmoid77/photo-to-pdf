@@ -397,8 +397,46 @@ def refine(small, full, mask, quad, spread, margin=.06):
     pages = []
     for side, start, stop, outer_left, outer_right in spans:
         _, guard_top = side_line('top', start, stop, 1, (start, stop))
+        top = guard_top(f'{side}-top')
+        if spread and top is not None:
+            # the paper of a spread bends down towards the fold: the straight top edge fitted away
+            # from the gutter overshoots the paper there and leaves a wedge of background in the
+            # corner. Pivot the line about its outer end down to the paper edge next to the fold
+            # (outside the gutter notch itself).
+            crease_x = slope * my + offset
+            lo, hi = (stop, crease_x - .012 * W) if side == 'L' else (crease_x + .012 * W, start)
+            a, b = top
+            near = np.arange(round(lo + (hi - lo) * 2 / 3), round(hi)) if side == 'L' else \
+                np.arange(round(lo), round(lo + (hi - lo) / 3))
+            if near.size >= 8:
+                base = np.round(a * near + b).astype(int)
+                depth = round(.03 * H)
+                rows = np.clip(base[None, :] + np.arange(depth + round(.03 * H))[:, None], 0, gray.shape[0] - 1)
+                strip = gray[rows, near[None, :]]
+                paper = np.median(strip[depth:], axis=0)
+                dark = (strip[:depth] < .55 * paper).mean(1)
+                # background rows under the line: a dark majority between pale logo letters,
+                # each column against the paper below it (a gutter shadow darkens both); ink
+                # strokes on the paper cover far fewer columns
+                inside = np.nonzero(dark < .2)[0]
+                dip = float(inside[0]) if inside.size else float(depth)
+                if dip > 2:
+                    gx = float(near.mean())
+                    ox = start if side == 'L' else stop
+                    oy = a * ox + b
+                    slope_dip = (a * gx + b + dip - oy) / (gx - ox)
+                    pivoted = slope_dip, oy - slope_dip * ox
+                    # pen strokes on paper between the two lines keep the straight edge (dark
+                    # gaps between pale logo letters on the background are not paper)
+                    span = (ink_x >= min(ox, crease_x)) & (ink_x <= max(ox, crease_x))
+                    tx, ty = ink_x[span], ink_y[span]
+                    between = (ty > a * tx + b) & (ty < pivoted[0] * tx + pivoted[1])
+                    on_paper = cv2.blur(gray, (31, 31))[ty[between], tx[between]] > .8 * np.median(paper)
+                    if on_paper.sum() < 15:
+                        top = pivoted
+                        info = dict(info, gutter_dip=info.get('gutter_dip', []) + [f'{side}:{dip:.0f}'])
         _, guard_bottom = side_line('bottom', start, stop, -1, (start, stop), 50)
-        top, bottom = guard_top(f'{side}-top'), guard_bottom(f'{side}-bottom')
+        bottom = guard_bottom(f'{side}-bottom')
         if None in (top, bottom, outer_left, outer_right):
             return None, info, flags
         corners = [meet(top, outer_left), meet(top, outer_right),

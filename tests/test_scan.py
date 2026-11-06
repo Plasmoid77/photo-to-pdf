@@ -44,15 +44,16 @@ def page_texture(rng, ruled=True, ink=True, colour=(236, 233, 224)):
 
 
 def spread_photo(rng, shadow=False, crease=True, cover_right=False, background=(35, 30, 28), bulge=0,
-                 date=False):
+                 date=False, dip=0, ruled=True):
     """A two-page spread warped into a 3200 x 2200 photo. Returns RGB image and true quads (L, R).
 
     `bulge` curves the outer edge of the left page outward by up to that many px (mid-height);
     `date` writes a blue mark in that bulge, outside the straight page rectangle.
+    `dip` bends the top edge of both pages down towards the fold, by that many px at the fold.
     """
-    flat = np.concatenate([page_texture(rng),
+    flat = np.concatenate([page_texture(rng, ruled),
                            page_texture(rng, ruled=False, ink=False, colour=(205, 195, 175)) if cover_right
-                           else page_texture(rng)], axis=1)
+                           else page_texture(rng, ruled)], axis=1)
     if bulge:
         extra = np.zeros((PAGE_H, bulge, 3), np.uint8)
         extra[:] = background
@@ -66,6 +67,10 @@ def spread_photo(rng, shadow=False, crease=True, cover_right=False, background=(
         x = np.arange(2 * PAGE_W, dtype=float)
         dark = np.where(x < PAGE_W, np.exp(-(PAGE_W - x) / 45.) * 70, np.exp(-(x - PAGE_W) / 8.) * 25)
         flat = np.clip(flat - dark[None, :, None], 0, 255).astype(np.uint8)
+    if dip:
+        x = np.arange(2 * PAGE_W, dtype=float)
+        drop = dip * np.clip(1 - np.abs(x - PAGE_W) / (.1 * PAGE_W), 0, 1) ** 2
+        flat[np.arange(PAGE_H)[:, None] < drop[None, :]] = background
     if crease:
         flat[:, bulge + PAGE_W - 1:bulge + PAGE_W + 1] = (120, 110, 100)
     photo = np.zeros((2200, 3200, 3), np.uint8)
@@ -146,6 +151,23 @@ class Detection(unittest.TestCase):
                 self.assertEqual(page['detection'], 'edges+gutter')
                 self.assertEqual(page['flags'], [], f'{name} {side} unexpectedly flagged')
                 self.assertLess(corner_error(page['quad'], quad, width), 1.0, f'{name} {side}')
+
+    def test_top_edge_follows_paper_down_to_the_fold(self):
+        # the straight top edge would leave a wedge of background in the gutter-top corners
+        # (unruled: the synthetic ruling is dark enough to count as pen strokes, which keep the edge)
+        image, left, right = spread_photo(self.rng, dip=60, ruled=False)
+        self.save('01-dip.jpg', image)
+        pages = {p['id'][-1]: p for p in self.prepare()['pages']}
+        matrix = cv2.getPerspectiveTransform(
+            np.float32([[0, 0], [2 * PAGE_W, 0], [2 * PAGE_W, PAGE_H], [0, PAGE_H]]),
+            np.float32([[420, 260], [2900, 300], [2960, 1960], [360, 1900]]))
+        to_flat = np.linalg.inv(matrix)
+        for side, corner, outer in (('L', 1, 0), ('R', 0, 1)):
+            quad = np.float32(pages[side]['quad']) * [3200, 2200]
+            flat = cv2.perspectiveTransform(quad.reshape(-1, 1, 2), to_flat)[:, 0]
+            self.assertGreater(flat[corner][1], 8, f'{side}: gutter-top corner left on the background')
+            self.assertLess(flat[corner][1], 75, f'{side}: gutter-top corner cut into the page')
+            self.assertLess(abs(flat[outer][1]), 8, f'{side}: outer top corner moved')
 
     def test_landscape_printing_stays_single(self):
         for kind in ('text', 'table', 'grid'):
