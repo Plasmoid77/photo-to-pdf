@@ -187,6 +187,19 @@ fold. Against the hand-checked reference the corners are off by a median of
 a blank strip of paper cut off at the bottom, no writing lost. No blind check
 was run for this notebook.
 
+The same request in Codex (main agent `gpt-6.1-sol`, medium; `gpt-5.6-luna`
+screeners) produced 153 pages in 9 min: 47 commands, 4.0 M input tokens (3.85 M
+cached) and 10.5 k output for the main agent, about 0.26 M for the screeners.
+The agent fixed the same places (cover, endpaper, corners, the fold on photo
+77); median corner error 0.9 % (outer) and 0.6 % (fold), no included page over
+3 %. The luna screeners marked no page, although the draft had a 7 % corner
+error (0077-L, caught by a `prepare` flag). On the same 153 images
+`gpt-6.1-terra` (0.4 M tokens) found 0077-L and 3–5 of the 16 pages at 2–3 %, but
+marked 37–43 pages: thin slivers of cover or background at the top edge (1–2 %
+of the width, which the reference keeps as well) and lines running into the
+fold. A stricter brief did not reduce the count. In Codex neither model replaces
+a Sonnet screener: rely on the `prepare` flags and look at the pages yourself.
+
 Known limits: a page edge is fitted with a straight line, so a strongly curled
 page keeps a sliver of background at the corners or loses a few pixels of paper.
 Pen strokes between the tight edge and the paper edge move the edge outward
