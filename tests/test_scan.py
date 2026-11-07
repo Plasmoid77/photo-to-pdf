@@ -277,6 +277,9 @@ class Pipeline(unittest.TestCase):
         photos = cls.tmp / 'photos'
         photos.mkdir()
         image, _, _ = spread_photo(np.random.default_rng(3), shadow=True)
+        for y in range(900, 1100, 45):     # blue writing near the outer edge of the left page
+            cv2.line(image, (430, y), (470, y + 25), (40, 60, 160), 3)
+            cv2.line(image, (470, y + 25), (500, y), (40, 60, 160), 3)
         Image.fromarray(image).save(photos / 'spread.jpg', quality=93)
         run('prepare', photos, '--work', cls.tmp / 'work')
         manifest = json.loads((cls.tmp / 'work' / 'manifest.json').read_text())
@@ -324,8 +327,22 @@ class Pipeline(unittest.TestCase):
         self.assertAlmostEqual(summary['aspect'], 1300 / 1650, delta=.012)
 
     def test_compare_writes_every_page(self):
-        run('compare', self.pdf.with_suffix('.scan.json'), '--work', self.tmp / 'compare')
+        result = run('compare', self.pdf.with_suffix('.scan.json'), '--work', self.tmp / 'compare')
         self.assertEqual(len(list((self.tmp / 'compare').glob('compare-*.jpg'))), 2)
+        self.assertNotIn('pen strokes', result.stdout)
+
+    def test_compare_reports_cut_writing(self):
+        manifest = json.loads(self.manifest.read_text())
+        for corner in (0, 3):                      # outer edge of the left page past the writing
+            manifest['pages'][0]['quad'][corner][0] += .045
+        path = self.tmp / 'cut.json'
+        path.write_text(json.dumps(manifest))
+        run('build', path, '--output', self.tmp / 'cut.pdf', '--width-mm', 165)
+        result = run('compare', self.tmp / 'cut.scan.json', '--work', self.tmp / 'compare-cut')
+        rows = json.loads((self.tmp / 'compare-cut' / 'compare.json').read_text())
+        self.assertGreater(rows[0]['cut']['left'], 20, rows[0])
+        self.assertIsNone(rows[0]['cut']['right'])            # fold side of the left page
+        self.assertIn('1 pages with pen strokes', result.stdout)
 
     def test_inspect_writes_sheet(self):
         run('inspect', self.manifest, '--work', self.tmp / 'inspect')

@@ -919,8 +919,8 @@ def review(args):
               'confirm a curved/torn paper edge):')
         print('\n'.join(strips))
     if suspects:
-        print(f'{len(suspects)} pages with dark pixels or writing at a border (compare them with the photos):')
-        print('\n'.join(suspects))
+        print(f'{len(suspects)} pages with dark pixels or writing in a thin border strip, a weak hint '
+              f'(per-side shares in edges.json; cut-off writing is reported by compare)')
 
 
 def oriented_size(path):
@@ -1096,6 +1096,44 @@ def measure(args):
     print(f'Details: {work / "measure.json"}')
 
 
+def cut_writing(view, mx, my, w, h, fold=None):
+    """Pen-stroke pixels on this sheet's paper outside the crop (view = page with a margin mx, my).
+
+    Per side, None on the fold side of a spread page: the facing page's writing lies there. Strokes
+    are thin, darker than the paper and bluer than its local tint, as in `prepare`; ruling and the
+    crease (long straight lines) do not count. Paper outside the crop must be connected to the page
+    itself (a white logo on the desk is not), away from a coloured cover edge, and the strokes must
+    not be near-black (gaps between letters of such a logo).
+    """
+    import cv2
+    import numpy as np
+    gray = cv2.cvtColor(view, cv2.COLOR_RGB2GRAY)
+    hsv = cv2.cvtColor(view, cv2.COLOR_RGB2HSV)
+    core = (slice(my + h // 4, my + 3 * h // 4), slice(mx + w // 4, mx + 3 * w // 4))
+    paper, paper_s = float(np.median(gray[core])), float(np.median(hsv[..., 1][core]))
+    tint = view[..., 2].astype('float32') - view[..., 1]
+    ink = ((cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, np.ones((11, 11), 'uint8')) > 40)
+           & (tint - cv2.blur(tint, (41, 41)) > 15)).astype('uint8')
+    lines = (cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((1, 31), 'uint8'))
+             | cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((31, 1), 'uint8')))
+    bright = cv2.morphologyEx((gray > .75 * paper).astype('uint8'), cv2.MORPH_OPEN, np.ones((5, 5), 'uint8'))
+    _, labels = cv2.connectedComponents(bright)
+    page = np.unique(labels[core])
+    sheet = cv2.dilate(np.isin(labels, page[page > 0]).astype('uint8'), np.ones((11, 11), 'uint8')) > 0
+    saturation = hsv[..., 1].astype('float32')
+    edge = cv2.morphologyEx((saturation > paper_s + 100).astype('uint8'), cv2.MORPH_OPEN, np.ones((1, 15), 'uint8'))
+    cover = (cv2.blur(saturation, (15, 15)) > paper_s + 60) | (cv2.dilate(edge, np.ones((15, 15), 'uint8')) > 0)
+    ink = ((ink > 0) & ~(cv2.dilate(lines, np.ones((5, 5), 'uint8')) > 0) & sheet & ~cover
+           & (cv2.blur(gray, (31, 31)) > .8 * paper) & (hsv[..., 2] > .35 * paper))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(cv2.dilate(ink.astype('uint8'), np.ones((3, 3), 'uint8')))
+    keep = np.zeros(count, bool)
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= 15
+    ink &= keep[labels]
+    regions = dict(top=ink[:my, mx:mx + w], bottom=ink[my + h:, mx:mx + w],
+                   left=ink[my:my + h, :mx], right=ink[my:my + h, mx + w:])
+    return {side: None if side == fold else int(region.sum()) for side, region in regions.items()}
+
+
 def compare(args):
     """Each built page re-warped from its photo with a margin, the crop drawn: what lies outside it."""
     import cv2
@@ -1111,7 +1149,7 @@ def compare(args):
                 fail(f'Invalid page range: {part}')
             wanted.update(range(int(a), int(b or a) + 1))
     work = work_dir(args.work, args.replace)
-    done, last, source = 0, None, None
+    done, last, source, rows = 0, None, None, []
     for page in record['pages']:
         if wanted is not None and page['page'] not in wanted:
             continue
@@ -1124,6 +1162,9 @@ def compare(args):
         shift = np.array([[1, 0, mx], [0, 1, my], [0, 0, 1]], float) @ np.array(page['matrix'])
         view = cv2.warpPerspective(source, shift, (w + 2 * mx, h + 2 * my), flags=cv2.INTER_CUBIC,
                                    borderValue=(60, 60, 60))
+        fold = {'L': 'right', 'R': 'left'}.get(page['id'][-1:])
+        rows.append(dict(page=page['page'], id=page['id'],
+                         cut=cut_writing(view, mx, my, w, h, fold)))
         image = Image.fromarray(view)
         draw = ImageDraw.Draw(image)
         draw.rectangle([mx - 1, my - 1, mx + w, my + h], outline=(255, 0, 40), width=2)
@@ -1132,7 +1173,15 @@ def compare(args):
         done += 1
     if not done:
         fail('No pages selected.')
+    dump(work / 'compare.json', rows)
     print(f'{done} pages -> {work}; red frame = PDF page border, outside it = what the crop left out.')
+    cut = [f"  page {row['page']} ({row['id']}): " + ', '.join(f'{k} {v} px' for k, v in row['cut'].items()
+                                                         if v and v > args.cut_limit)
+           for row in rows if any(v and v > args.cut_limit for v in row['cut'].values())]
+    if cut:
+        print(f'{len(cut)} pages with pen strokes on the paper outside the crop (writing cut off at an outer '
+              'edge; the fold side is not checked):')
+        print('\n'.join(cut))
 
 
 def edge_metrics(paths, strip_depth=.6):
@@ -1295,6 +1344,8 @@ def main():
     p.add_argument('--pages', help='For example 3,7-9; default all')
     p.add_argument('--margin', type=float, default=.04, help='Margin as a share of the page size')
     p.add_argument('--max-edge', type=positive, default=1400)
+    p.add_argument('--cut-limit', type=int, default=20,
+                   help='pen-stroke pixels outside the crop on one side worth a look')
     p.set_defaults(run=compare)
     p = subs.add_parser('inspect', help='Corner close-ups of manifest quads for manual correction')
     p.add_argument('manifest', type=Path)

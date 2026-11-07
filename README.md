@@ -52,9 +52,10 @@ downscaled for this page.
   re-encoding. Optional crops change only PDF boxes; the image streams are
   verified unchanged.
 - **Measurement and review.** Measures the physical page size from the grid
-  cells. Renders every page, lists pages with a strip of background or cover
-  inside an edge (measured, no model needed) and pages with writing at a border,
-  and shows each page with a margin of the photo around its crop.
+  cells. Renders every page and lists pages with a strip of background or cover
+  inside an edge. Shows each page with a margin of the photo around its crop and
+  lists pages whose writing runs past the crop at an outer edge. Both lists are
+  measured, no model needed.
 
 ## Taking the photos
 
@@ -212,8 +213,19 @@ side) it listed 34 pages of that Codex draft, including all 31 left pages with
 a strip of cover at the top, none of the 153 pages of the hand-checked PDF of
 the same notebook, and 7 of the 91 pages of the thin notebook's final PDF, all
 torn or curved paper edges with 0.6–1.6 % of background. It costs no tokens.
-It does not see cut writing or a fold placed inside a page (such as 0077-L);
-those are left to the `prepare` flags and the `compare` images.
+It does not see cut writing or a fold placed inside a page (such as 0077-L).
+
+`compare` now lists cut writing at the outer edges: pen strokes on the sheet's
+own paper outside the crop (ruling, the crease, the desk, a logo on it and a
+cover edge do not count). It listed no page of the hand-checked thick notebook
+or of the Codex draft, and 4 of the 91 pages of the thin notebook's
+hand-checked PDF; all 4 were real, checked by eye: tops of letters in the first
+line on two pages and dates written along the outer edge on two. With the outer
+edges of the thick notebook moved 1.5 % inward it listed 33 pages, mostly the
+last line at the bottom. The fold side is not checked: there the facing page's
+writing lies outside the crop, and a misplaced fold is left to the `prepare`
+flags. With these two lists, the `prepare` flags cover what the cheap screeners
+were for; the screeners remain optional.
 
 Known limits: a page edge is fitted with a straight line, so a strongly curled
 page keeps a sliver of background at the corners or loses a few pixels of paper.
@@ -234,7 +246,7 @@ The tests generate synthetic spreads with and without a gutter shadow, plus a
 cardboard cover, a blue cover rim above the pages, and a curved outer edge with and without a date written in it.
 They check detection accuracy and flags, keeping margin writing, `eval` (including a
 detected failure), `build` page size, refusal to build unreviewed pages, `crop`
-with unchanged image streams, `measure` of a known grid, `compare`, `inspect` and
+with unchanged image streams, `measure` of a known grid, `compare` (including cut writing), `inspect` and
 `review` (including a strip of background at an edge).
 
 ## License
