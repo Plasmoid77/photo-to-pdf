@@ -167,7 +167,7 @@ the effort. In this test `prepare` took 143 s for 48 photos (33 s for the origin
 version); it now processes photos in parallel and takes 22 s on 8 cores (36 s for
 the 78 photos of the thick notebook), with identical output.
 
-A third run of the same task used the cheap-model screening from `SKILL.md`:
+A third run of the same task used the cheap-model screening (now in `references/screening.md`):
 six Sonnet agents looked at all 91 `compare` images, and the main agent (Opus)
 opened only the 13 flagged pages and the 11 pages the screeners marked (3 real
 defects, fixed). The three final PDFs were then compared side by side in one blind check.
