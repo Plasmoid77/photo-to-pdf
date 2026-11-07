@@ -121,7 +121,7 @@ Draft outlines from `prepare` against the verified manifests of the same photos
 
 | | original version (8fa42d6) | current version |
 |---|---|---|
-| thick notebook, 78 photos: median / pages over 3 % / silent failures | 3.8 % / 99 of 154 / no flags at all, every outline is a draft | 1.1 % / 5 of 153 / 0 (15 pages flagged) |
+| thick notebook, 78 photos: median / pages over 3 % / silent failures | 3.8 % / 99 of 154 / no flags at all, every outline is a draft | 0.7 % / 5 of 153 / 0 (13 pages flagged) |
 | thin notebook, 48 photos: pages found / median / pages over 3 % / silent | 35 of 95 / 20.5 % / 33 / no flags | 95 of 95 / 0.5 % / 6 / 1 (14 flagged) |
 
 The silent failure on the thin notebook is the top of a fold 3.6 % too high (a
@@ -131,7 +131,11 @@ corner at the fold. `prepare` now pivots the top edge down to the paper there
 (`gutter_dip` in the manifest), unless pen strokes on the paper lie in the way.
 The hand-checked reference of the thick notebook had kept that wedge; its
 gutter-top corners were moved down to the paper on 58 pages, each checked by
-eye, and both columns are measured against the corrected reference.
+eye, and both columns are measured against the corrected reference. A
+coloured cover with a bright rim above the pages used to pull the top edge onto
+the rim, leaving a strip of cover inside 35 left pages of the thick notebook
+(0.6–2 % of the width); the edge now steps over a saturated band to the paper,
+which brought the median outer-corner error there from 0.9 % to 0.3 %.
 
 ## Test on a real task
 
@@ -216,7 +220,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 The tests generate synthetic spreads with and without a gutter shadow, plus a
-cardboard cover, and a curved outer edge with and without a date written in it.
+cardboard cover, a blue cover rim above the pages, and a curved outer edge with and without a date written in it.
 They check detection accuracy and flags, keeping margin writing, `eval` (including a
 detected failure), `build` page size, refusal to build unreviewed pages, `crop`
 with unchanged image streams, `measure` of a known grid, `compare`, `inspect` and

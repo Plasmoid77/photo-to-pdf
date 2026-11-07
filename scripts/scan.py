@@ -310,6 +310,8 @@ def refine(small, full, mask, quad, spread, margin=.06):
            & (tint - cv2.blur(tint, (41, 41)) > 15)
            & (cv2.erode(sheet.astype('uint8'), np.ones((9, 9), 'uint8')) > 0))
     ink_y, ink_x = np.nonzero(ink)
+    saturation = cv2.cvtColor(colour, cv2.COLOR_RGB2HSV)[..., 1]
+    tinted = max(90., float(np.median(saturation[sheet])) + 80)   # warm light tints paper too
     reach = round(.02 * W)
     widened, clipped, capped = [], [], []
     def edge(name, start, stop):
@@ -345,6 +347,17 @@ def refine(small, full, mask, quad, spread, margin=.06):
         best = contrast.argmax(1)
         strong = contrast[np.arange(len(steps)), best] >= 25
         found = np.where(strong, position[np.arange(len(steps)), best], found)
+        # a coloured cover edge with a bright rim lies outside the paper: the rim-to-background
+        # step wins above, so step inward over a saturated band that starts right at the edge
+        band = np.clip(found[:, None] - outward * np.arange(reach)[None, :], 0, limit)
+        coloured = (saturation if name in ('left', 'right') else saturation.T)[rows, band] > tinted
+        plain = np.cumsum(np.pad(~coloured, ((0, 0), (1, 0))), 1)
+        plain = plain[:, 4:] - plain[:, :-4] == 4          # four plain pixels in a row
+        for i in np.nonzero(coloured[:, :8].any(1))[0]:
+            first = int(coloured[i, :8].argmax())
+            run = np.nonzero(plain[i, first:])[0]
+            if run.size and run[0] >= 3:
+                found[i] = band[i, first + run[0]]
         return steps, found
     def guard(line, samples, inward, name, start, stop, label):
         """Move a fitted edge outward over blue ink lying between it and the outermost paper line."""

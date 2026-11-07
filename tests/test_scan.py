@@ -44,12 +44,13 @@ def page_texture(rng, ruled=True, ink=True, colour=(236, 233, 224)):
 
 
 def spread_photo(rng, shadow=False, crease=True, cover_right=False, background=(35, 30, 28), bulge=0,
-                 date=False, dip=0, ruled=True):
+                 date=False, dip=0, ruled=True, cover_top=0):
     """A two-page spread warped into a 3200 x 2200 photo. Returns RGB image and true quads (L, R).
 
     `bulge` curves the outer edge of the left page outward by up to that many px (mid-height);
     `date` writes a blue mark in that bulge, outside the straight page rectangle.
     `dip` bends the top edge of both pages down towards the fold, by that many px at the fold.
+    `cover_top` shows that many px of a blue cover above the pages, with a bright rim on its edge.
     """
     flat = np.concatenate([page_texture(rng, ruled),
                            page_texture(rng, ruled=False, ink=False, colour=(205, 195, 175)) if cover_right
@@ -73,12 +74,17 @@ def spread_photo(rng, shadow=False, crease=True, cover_right=False, background=(
         flat[np.arange(PAGE_H)[:, None] < drop[None, :]] = background
     if crease:
         flat[:, bulge + PAGE_W - 1:bulge + PAGE_W + 1] = (120, 110, 100)
+    if cover_top:
+        band = np.zeros((cover_top, flat.shape[1], 3), np.uint8)
+        band[:] = (40, 110, 200)
+        band[:4] = (225, 230, 235)
+        flat = np.concatenate([band, flat], axis=0)
     photo = np.zeros((2200, 3200, 3), np.uint8)
     photo[:] = background
     corners = np.float32([[0, 0], [2 * PAGE_W, 0], [2 * PAGE_W, PAGE_H], [0, PAGE_H]])
     target = np.float32([[420, 260], [2900, 300], [2960, 1960], [360, 1900]])
     matrix = cv2.getPerspectiveTransform(corners, target)
-    shift = np.array([[1, 0, -bulge], [0, 1, 0], [0, 0, 1]], float)
+    shift = np.array([[1, 0, -bulge], [0, 1, -cover_top], [0, 0, 1]], float)
     cv2.warpPerspective(flat, matrix @ shift, (3200, 2200), photo, borderMode=cv2.BORDER_TRANSPARENT,
                         flags=cv2.INTER_LINEAR)
     def project(points):
@@ -168,6 +174,23 @@ class Detection(unittest.TestCase):
             self.assertGreater(flat[corner][1], 8, f'{side}: gutter-top corner left on the background')
             self.assertLess(flat[corner][1], 75, f'{side}: gutter-top corner cut into the page')
             self.assertLess(abs(flat[outer][1]), 8, f'{side}: outer top corner moved')
+
+    def test_top_edge_excludes_a_coloured_cover_rim(self):
+        # the bright rim of the cover above the pages gives a stronger step to the background
+        # than the paper does; the top edge must stay on the paper, not on the cover
+        image, left, right = spread_photo(self.rng, cover_top=24)
+        self.save('01-cover.jpg', image)
+        pages = {p['id'][-1]: p for p in self.prepare()['pages']}
+        matrix = cv2.getPerspectiveTransform(
+            np.float32([[0, 0], [2 * PAGE_W, 0], [2 * PAGE_W, PAGE_H], [0, PAGE_H]]),
+            np.float32([[420, 260], [2900, 300], [2960, 1960], [360, 1900]]))
+        to_flat = np.linalg.inv(matrix)
+        for side in 'LR':
+            quad = np.float32(pages[side]['quad']) * [3200, 2200]
+            flat = cv2.perspectiveTransform(quad.reshape(-1, 1, 2), to_flat)[:, 0]
+            for corner in (0, 1):
+                self.assertGreater(flat[corner][1], -4, f'{side}: cover inside the top edge')
+                self.assertLess(flat[corner][1], 10, f'{side}: top edge cut into the page')
 
     def test_landscape_printing_stays_single(self):
         for kind in ('text', 'table', 'grid'):
