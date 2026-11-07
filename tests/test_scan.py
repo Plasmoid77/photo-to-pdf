@@ -372,5 +372,51 @@ class Pipeline(unittest.TestCase):
         self.assertIn('1 pages with a strip', result.stdout)
 
 
+
+class Metrics(unittest.TestCase):
+    """Edge cases of the measured checks, called directly."""
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(SCAN.parent))
+        import scan
+        cls.scan = scan
+
+    @staticmethod
+    def view(dark_core=False):
+        """A 400 x 500 page with a 40 px margin: paper inside and in the top-left margin corner."""
+        view = np.full((580, 480, 3), (30, 30, 35), np.uint8)
+        view[40:540, 40:440] = (232, 230, 222)
+        view[5:40, 5:40] = (232, 230, 222)              # paper beyond the top-left corner of the crop
+        view[5:40, 40:200] = (232, 230, 222)             # and along the top edge
+        if dark_core:
+            view[150:430, 120:360] = (20, 20, 20)
+        return view
+
+    def test_cut_writing_counts_corner_strokes(self):
+        view = self.view()
+        cv2.line(view, (12, 20), (30, 28), (40, 60, 160), 3)    # entirely beyond the corner
+        cut = self.scan.cut_writing(view, 40, 40, 400, 500, fold='right')
+        self.assertGreater(cut['top'], 0, cut)
+        self.assertIsNone(cut['right'])
+
+    def test_cut_writing_with_a_dark_drawing_in_the_middle(self):
+        view = self.view(dark_core=True)
+        cv2.line(view, (80, 20), (120, 30), (40, 60, 160), 3)   # above the top edge, on paper
+        cut = self.scan.cut_writing(view, 40, 40, 400, 500)
+        self.assertGreater(cut['top'], 0, cut)
+
+    def test_edge_metrics_on_tiny_pages(self):
+        folder = Path(tempfile.mkdtemp(prefix='photo-to-pdf-metrics-'))
+        try:
+            paths = []
+            for size in (40, 2):
+                paths.append(folder / f'page-{size}.jpg')
+                Image.new('RGB', (size, size), 'white').save(paths[-1])
+            rows = self.scan.edge_metrics(paths)
+            self.assertEqual([r['strip']['top']['share'] for r in rows], [0, 0])
+        finally:
+            shutil.rmtree(folder)
+
+
 if __name__ == '__main__':
     unittest.main()

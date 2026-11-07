@@ -1109,8 +1109,13 @@ def cut_writing(view, mx, my, w, h, fold=None):
     import numpy as np
     gray = cv2.cvtColor(view, cv2.COLOR_RGB2GRAY)
     hsv = cv2.cvtColor(view, cv2.COLOR_RGB2HSV)
+    inside = (slice(my, my + h), slice(mx, mx + w))
     core = (slice(my + h // 4, my + 3 * h // 4), slice(mx + w // 4, mx + 3 * w // 4))
-    paper, paper_s = float(np.median(gray[core])), float(np.median(hsv[..., 1][core]))
+    paper = float(np.median(gray[core]))
+    if paper < .7 * np.percentile(gray[inside], 90):      # a dark drawing fills the middle
+        paper = float(np.percentile(gray[inside], 90))
+    plain = gray[inside] > .8 * paper
+    paper_s = float(np.median(hsv[..., 1][inside][plain])) if plain.any() else 0.
     tint = view[..., 2].astype('float32') - view[..., 1]
     ink = ((cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, np.ones((11, 11), 'uint8')) > 40)
            & (tint - cv2.blur(tint, (41, 41)) > 15)).astype('uint8')
@@ -1118,10 +1123,13 @@ def cut_writing(view, mx, my, w, h, fold=None):
              | cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((31, 1), 'uint8')))
     bright = cv2.morphologyEx((gray > .75 * paper).astype('uint8'), cv2.MORPH_OPEN, np.ones((5, 5), 'uint8'))
     _, labels = cv2.connectedComponents(bright)
-    page = np.unique(labels[core])
+    share = np.bincount(labels[inside].ravel(), minlength=labels.max() + 1)
+    page = np.nonzero(share >= .05 * w * h)[0]           # the sheet's own paper, not a bright logo
     sheet = cv2.dilate(np.isin(labels, page[page > 0]).astype('uint8'), np.ones((11, 11), 'uint8')) > 0
     saturation = hsv[..., 1].astype('float32')
-    edge = cv2.morphologyEx((saturation > paper_s + 100).astype('uint8'), cv2.MORPH_OPEN, np.ones((1, 15), 'uint8'))
+    vivid = (saturation > paper_s + 100).astype('uint8')     # a cover edge runs far along a side
+    edge = (cv2.morphologyEx(vivid, cv2.MORPH_OPEN, np.ones((1, 61), 'uint8'))
+            | cv2.morphologyEx(vivid, cv2.MORPH_OPEN, np.ones((61, 1), 'uint8')))
     cover = (cv2.blur(saturation, (15, 15)) > paper_s + 60) | (cv2.dilate(edge, np.ones((15, 15), 'uint8')) > 0)
     ink = ((ink > 0) & ~(cv2.dilate(lines, np.ones((5, 5), 'uint8')) > 0) & sheet & ~cover
            & (cv2.blur(gray, (31, 31)) > .8 * paper) & (hsv[..., 2] > .35 * paper))
@@ -1129,7 +1137,9 @@ def cut_writing(view, mx, my, w, h, fold=None):
     keep = np.zeros(count, bool)
     keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= 15
     ink &= keep[labels]
-    regions = dict(top=ink[:my, mx:mx + w], bottom=ink[my + h:, mx:mx + w],
+    lo = mx if fold == 'left' else 0                     # corners belong to top/bottom, not past a fold
+    hi = mx + w if fold == 'right' else ink.shape[1]
+    regions = dict(top=ink[:my, lo:hi], bottom=ink[my + h:, lo:hi],
                    left=ink[my:my + h, :mx], right=ink[my:my + h, mx + w:])
     return {side: None if side == fold else int(region.sum()) for side, region in regions.items()}
 
@@ -1210,15 +1220,20 @@ def edge_metrics(paths, strip_depth=.6):
             sw, sh = max(2, round(wide * w)), max(2, round(wide * h))
             strips = dict(top=mask[:sh], bottom=mask[-sh:], left=mask[:, :sw], right=mask[:, -sw:])
             row[name] = {k: round(float(v.mean()) * 100, 2) for k, v in strips.items()}
-        core = hsv[h // 4:3 * h // 4, w // 4:3 * w // 4].reshape(-1, 3)
-        paper_v, paper_s = np.median(core[:, 2]), np.median(core[:, 1])
+        paper_v = np.median(hsv[h // 4:3 * h // 4, w // 4:3 * w // 4, 2])
+        if paper_v < .7 * np.percentile(hsv[..., 2], 90):    # a dark drawing fills the middle
+            paper_v = np.percentile(hsv[..., 2], 90)
+        plain = hsv[..., 2] > .8 * paper_v
+        paper_s = np.median(hsv[..., 1][plain]) if plain.any() else 0
         alien = (hsv[..., 2] < .45 * paper_v) | (hsv[..., 1] > max(90, paper_s + 80))
         alien = cv2.morphologyEx(alien.astype('uint8'), cv2.MORPH_OPEN, np.ones((3, 3), 'uint8')) > 0
-        reach = round(.06 * w)
+        reach = max(3, round(.06 * w))
         row['strip'] = {}
         for side, mask in (('top', alien), ('bottom', alien[::-1]), ('left', alien.T), ('right', alien.T[::-1])):
             paper = ~mask[:reach]
             plain = paper[:-2] & paper[1:-1] & paper[2:]          # three paper pixels in a row
+            if not plain.size:                                     # page thinner than three pixels
+                plain = np.ones((1, mask.shape[1]), bool)
             run = np.where(plain.any(0), plain.argmax(0), reach) / w * 100
             row['strip'][side] = dict(share=round(float(np.mean(run > strip_depth)) * 100, 1),
                                       depth=round(float(np.percentile(run, 90)), 2))
