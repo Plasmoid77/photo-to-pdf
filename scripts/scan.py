@@ -901,17 +901,25 @@ def review(args):
     if not paths:
         fail('No pages rendered.')
     contact(paths, work, 'pages')
-    rows = edge_metrics(paths)
+    rows = edge_metrics(paths, args.strip_depth)
     dump(work / 'edges.json', rows)
-    suspects = []
+    suspects, strips = [], []
     for row in rows:
         notes = [f'{k} dark {v} %' for k, v in row['dark'].items() if v > args.dark_limit]
         notes += [f'{k} ink {v} %' for k, v in row['ink'].items() if v > args.ink_limit]
         if notes:
             suspects.append(f"  page {row['page']}: " + ', '.join(notes))
+        notes = [f"{k} {v['depth']} % deep along {v['share']:.0f} % of the side" for k, v in row['strip'].items()
+                 if v['share'] > args.strip_share]
+        if notes:
+            strips.append(f"  page {row['page']}: " + ', '.join(notes))
     print(f'{len(paths)} pages rendered; inspect ALL sheets and individual edge exceptions: {work}')
+    if strips:
+        print(f'{len(strips)} pages with a strip of background or cover inside an edge (fix the outline or '
+              'confirm a curved/torn paper edge):')
+        print('\n'.join(strips))
     if suspects:
-        print(f'{len(suspects)} pages with background or writing at a border (compare them with the photos):')
+        print(f'{len(suspects)} pages with dark pixels or writing at a border (compare them with the photos):')
         print('\n'.join(suspects))
 
 
@@ -1127,8 +1135,14 @@ def compare(args):
     print(f'{done} pages -> {work}; red frame = PDF page border, outside it = what the crop left out.')
 
 
-def edge_metrics(paths):
-    """Per rendered page: dark (non-paper) share of a 0.6 % border strip and ink share of a 0.4 % strip."""
+def edge_metrics(paths, strip_depth=.6):
+    """Per rendered page: dark (non-paper) share of a 0.6 % border strip, ink share of a 0.4 % strip,
+    and a strip of background or cover running in from each side.
+
+    `strip` per side: `share` = % of the side along which non-paper (much darker than the paper,
+    or far more saturated: a coloured cover) runs in from the edge deeper than `strip_depth` % of the
+    page width; `depth` = 90th percentile of that run along the side, % of the page width.
+    """
     import numpy as np
     from PIL import Image
     import cv2
@@ -1147,6 +1161,18 @@ def edge_metrics(paths):
             sw, sh = max(2, round(wide * w)), max(2, round(wide * h))
             strips = dict(top=mask[:sh], bottom=mask[-sh:], left=mask[:, :sw], right=mask[:, -sw:])
             row[name] = {k: round(float(v.mean()) * 100, 2) for k, v in strips.items()}
+        core = hsv[h // 4:3 * h // 4, w // 4:3 * w // 4].reshape(-1, 3)
+        paper_v, paper_s = np.median(core[:, 2]), np.median(core[:, 1])
+        alien = (hsv[..., 2] < .45 * paper_v) | (hsv[..., 1] > max(90, paper_s + 80))
+        alien = cv2.morphologyEx(alien.astype('uint8'), cv2.MORPH_OPEN, np.ones((3, 3), 'uint8')) > 0
+        reach = round(.06 * w)
+        row['strip'] = {}
+        for side, mask in (('top', alien), ('bottom', alien[::-1]), ('left', alien.T), ('right', alien.T[::-1])):
+            paper = ~mask[:reach]
+            plain = paper[:-2] & paper[1:-1] & paper[2:]          # three paper pixels in a row
+            run = np.where(plain.any(0), plain.argmax(0), reach) / w * 100
+            row['strip'][side] = dict(share=round(float(np.mean(run > strip_depth)) * 100, 1),
+                                      depth=round(float(np.percentile(run, 90)), 2))
         rows.append(row)
     return rows
 
@@ -1282,6 +1308,10 @@ def main():
     p.add_argument('--max-edge', type=positive, default=1400)
     p.add_argument('--dark-limit', type=float, default=10.0, help='%% dark pixels in a border strip worth a look')
     p.add_argument('--ink-limit', type=float, default=1.0, help='%% ink pixels in a border strip worth a look')
+    p.add_argument('--strip-depth', type=float, default=.6,
+                   help='background/cover running in deeper than this %% of the page width counts as a strip')
+    p.add_argument('--strip-share', type=float, default=20.0,
+                   help='%% of a side covered by such a strip worth a look')
     p.set_defaults(run=review)
     for p in subs.choices.values():
         p.add_argument('--replace', action='store_true', help='Allow replacing task outputs, never source photos')

@@ -337,6 +337,22 @@ class Pipeline(unittest.TestCase):
         rows = json.loads((self.tmp / 'review' / 'edges.json').read_text())
         self.assertEqual(len(rows), 2)
         self.assertIn('pages rendered', result.stdout)
+        for row in rows:     # tight outlines and a deep gutter shadow: no strip anywhere
+            self.assertTrue(all(v['share'] < 20 for v in row['strip'].values()), row['strip'])
+
+    @unittest.skipUnless(shutil.which('pdftoppm'), 'Poppler pdftoppm not installed')
+    def test_review_reports_background_strip(self):
+        manifest = json.loads(self.manifest.read_text())
+        for corner in manifest['pages'][0]['quad'][:2]:     # top of the left page 2 % into the desk
+            corner[1] -= .012
+        path = self.tmp / 'strip.json'
+        path.write_text(json.dumps(manifest))
+        run('build', path, '--output', self.tmp / 'strip.pdf', '--width-mm', 165)
+        result = run('review', self.tmp / 'strip.pdf', '--work', self.tmp / 'review-strip')
+        rows = json.loads((self.tmp / 'review-strip' / 'edges.json').read_text())
+        self.assertGreater(rows[0]['strip']['top']['share'], 80, rows[0]['strip'])
+        self.assertLess(rows[1]['strip']['top']['share'], 20, rows[1]['strip'])
+        self.assertIn('1 pages with a strip', result.stdout)
 
 
 if __name__ == '__main__':

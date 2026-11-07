@@ -52,8 +52,9 @@ downscaled for this page.
   re-encoding. Optional crops change only PDF boxes; the image streams are
   verified unchanged.
 - **Measurement and review.** Measures the physical page size from the grid
-  cells. Renders every page, reports background or writing at page borders, and
-  shows each page with a margin of the photo around its crop.
+  cells. Renders every page, lists pages with a strip of background or cover
+  inside an edge (measured, no model needed) and pages with writing at a border,
+  and shows each page with a margin of the photo around its crop.
 
 ## Taking the photos
 
@@ -204,6 +205,16 @@ of the width, which the reference keeps as well) and lines running into the
 fold. A stricter brief did not reduce the count. In Codex neither model replaces
 a Sonnet screener: rely on the `prepare` flags and look at the pages yourself.
 
+`review` now measures such strips itself: along each side, how deep non-paper
+(much darker than the paper, or a saturated cover) runs in from the edge. With
+the defaults (deeper than 0.6 % of the page width along more than 20 % of a
+side) it listed 34 pages of that Codex draft, including all 31 left pages with
+a strip of cover at the top, none of the 153 pages of the hand-checked PDF of
+the same notebook, and 7 of the 91 pages of the thin notebook's final PDF, all
+torn or curved paper edges with 0.6–1.6 % of background. It costs no tokens.
+It does not see cut writing or a fold placed inside a page (such as 0077-L);
+those are left to the `prepare` flags and the `compare` images.
+
 Known limits: a page edge is fitted with a straight line, so a strongly curled
 page keeps a sliver of background at the corners or loses a few pixels of paper.
 Pen strokes between the tight edge and the paper edge move the edge outward
@@ -224,7 +235,7 @@ cardboard cover, a blue cover rim above the pages, and a curved outer edge with 
 They check detection accuracy and flags, keeping margin writing, `eval` (including a
 detected failure), `build` page size, refusal to build unreviewed pages, `crop`
 with unchanged image streams, `measure` of a known grid, `compare`, `inspect` and
-`review`.
+`review` (including a strip of background at an edge).
 
 ## License
 
