@@ -230,6 +230,17 @@ writing lies outside the crop, and a misplaced fold is left to the `prepare`
 flags. With these two lists, the `prepare` flags cover what the cheap screeners
 were for; the screeners remain optional.
 
+The same Codex request was then run once with this version and no screeners
+at all. It took 16.7 min, 39 commands, 10.0 M input tokens (9.7 M cached) and
+24 k output (plus 8 k reasoning). The agent fixed the cover and endpaper as
+before, then trimmed about 120 corners by eye 0.3–2.5 % inward to drop thin
+wedges of desk on blank margins, mostly at the top next to the fold. Its final
+PDF has no strip and no cut writing in the `review` and `compare` lists. Against
+the reference, which follows the paper edge, the corners are off by a median of
+0.3 % (outer) and 1.2 % (fold); the two pages over 3 % are such trims of blank
+paper at the fold, checked by eye. One run; the extra time and tokens against
+the screened run went into that manual trimming.
+
 Known limits: a page edge is fitted with a straight line, so a strongly curled
 page keeps a sliver of background at the corners or loses a few pixels of paper.
 Pen strokes between the tight edge and the paper edge move the edge outward
