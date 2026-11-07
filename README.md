@@ -124,10 +124,13 @@ Draft outlines from `prepare` against the verified manifests of the same photos
 | | original version (8fa42d6) | current version |
 |---|---|---|
 | thick notebook, 78 photos: median / pages over 3 % / silent failures | 3.8 % / 99 of 154 / no flags at all, every outline is a draft | 0.7 % / 5 of 153 / 0 (13 pages flagged) |
-| thin notebook, 48 photos: pages found / median / pages over 3 % / silent | 35 of 95 / 20.5 % / 33 / no flags | 95 of 95 / 0.5 % / 6 / 1 (14 flagged) |
+| thin notebook, 48 photos: pages found / median / pages over 3 % / silent | 35 of 95 / 20.5 % / 33 / no flags | 95 of 95 / 0.5 % / 5 / 0 (14 flagged) |
 
-The silent failure on the thin notebook is the top of a fold 3.6 % too high (a
-strip of background, no writing lost). On a spread the paper bends down
+`compare` (below) found writing cut off on 4 pages of the thin notebook's
+hand-checked reference; their edges were moved out to the writing, and the
+current column is measured against that reference. Before, one page counted as a
+silent failure: the top of a fold 3.6 % too high; against the corrected
+reference it is 2.8 %. On a spread the paper bends down
 towards the fold, so a straight top edge leaves a wedge of background in the
 corner at the fold. `prepare` now pivots the top edge down to the paper there
 (`gutter_dip` in the manifest), unless pen strokes on the paper lie in the way.
